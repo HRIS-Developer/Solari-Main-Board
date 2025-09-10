@@ -26,8 +26,22 @@ I2SClass i2s;
 // Task handles and queues
 QueueHandle_t imageQueue = nullptr;
 QueueHandle_t audioQueue = nullptr;
+QueueHandle_t vqaQueue = nullptr;
 TaskHandle_t imageTaskHandle = nullptr;
 TaskHandle_t audioTaskHandle = nullptr;
+TaskHandle_t vqaTaskHandle = nullptr;
+
+// VQA state management
+struct VQAState {
+  bool imageTransmissionComplete = false;
+  bool audioRecordingInProgress = false;
+  bool audioRecordingComplete = false;
+  uint8_t* audioBuffer = nullptr;
+  size_t audioSize = 0;
+  unsigned long audioRecordingStartTime = 0;
+  TaskHandle_t backgroundAudioTaskHandle = nullptr;
+};
+VQAState vqaState;
 
 
 
@@ -85,12 +99,56 @@ void logMemory(const String &component) {
   }
 }
 
-// Progress logger for data transfers
+// Progress logger for data transfers with visual progress bar
 void logProgress(const String &component, size_t current, size_t total) {
   if (currentLogLevel <= LOG_INFO) {
     int percent = (current * 100) / total;
-    log(LOG_INFO, component, "Progress: " + String(current) + "/" + 
-        String(total) + " bytes (" + String(percent) + "%)");
+    
+    // Create progress bar
+    const int barWidth = 20;
+    int filled = (percent * barWidth) / 100;
+    String progressBar = "[";
+    
+    for (int i = 0; i < barWidth; i++) {
+      if (i < filled) {
+        progressBar += "█";
+      } else {
+        progressBar += "░";
+      }
+    }
+    progressBar += "]";
+    
+    log(LOG_INFO, component, progressBar + " (" + String(percent) + "%) " + 
+        String(current) + "/" + String(total) + " bytes");
+  }
+}
+
+// Enhanced progress logger with transfer rate
+void logProgressWithRate(const String &component, size_t current, size_t total, unsigned long startTime) {
+  if (currentLogLevel <= LOG_INFO) {
+    int percent = (current * 100) / total;
+    unsigned long elapsed = millis() - startTime;
+    float rate = 0;
+    if (elapsed > 0) {
+      rate = (current / 1024.0) / (elapsed / 1000.0); // KB/s
+    }
+    
+    // Create progress bar
+    const int barWidth = 20;
+    int filled = (percent * barWidth) / 100;
+    String progressBar = "[";
+    
+    for (int i = 0; i < barWidth; i++) {
+      if (i < filled) {
+        progressBar += "█";
+      } else {
+        progressBar += "░";
+      }
+    }
+    progressBar += "]";
+    
+    log(LOG_INFO, component, progressBar + " (" + String(percent) + "%) " + 
+        String(current) + "/" + String(total) + " bytes - " + String(rate, 1) + " KB/s");
   }
 }
 
@@ -149,6 +207,14 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         logInfo("CMD", "Audio recording queued");
       } else {
         logWarn("CMD", "Audio capture ignored - queue full");
+      }
+    }
+    else if (value == "VQA") {
+      uint8_t token = 1;
+      if (vqaQueue && xQueueSend(vqaQueue, &token, 0) == pdTRUE) {
+        logInfo("CMD", "VQA operation queued");
+      } else {
+        logWarn("CMD", "VQA operation ignored - queue full");
       }
     }
     else {
@@ -215,7 +281,7 @@ void initCamera() {
     while (true) delay(100);
   }
   
-  logInfo("CAM", "Camera ready - HD resolution, JPEG format");
+  logInfo("CAM", "Camera ready");
   logMemory("CAM");
 }
 
@@ -232,13 +298,13 @@ void initMicrophone() {
     i2s.setPinsPdmRx(42, 41);
     logDebug("MIC", "PDM pins configured: CLK=42, DATA=41");
 
-    // Begin I2S in PDM RX mode, 16-bit mono, 16kHz
-    if (!i2s.begin(I2S_MODE_PDM_RX, 16000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    // Begin I2S in PDM RX mode, 4-bit mono, 4kHz to 16-bit mono, 16kHz
+    if (!i2s.begin(I2S_MODE_PDM_RX, 8000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
         logError("MIC", "I2S initialization failed!");
         while (true) delay(100);
     }
     
-    logInfo("MIC", "Microphone ready - 16kHz, 16-bit, mono");
+    logInfo("MIC", "Microphone ready");
     logMemory("MIC");
 }
 
@@ -252,6 +318,7 @@ void initBLE() {
     logInfo("BLE", "Initializing Bluetooth LE...");
     
     BLEDevice::init("XIAO_ESP32S3");
+    BLEDevice::setMTU(517);
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -352,9 +419,9 @@ void imageTask(void *param) {
         chunkCount++;
         vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
         
-        // Log progress every 20 chunks or at the end
-        if (chunkCount % 20 == 0 || sentBytes >= totalSize) {
-          logProgress("IMG", sentBytes, totalSize);
+        // Log progress every 10 chunks or at the end with visual progress bar
+        if (chunkCount % 10 == 0 || sentBytes >= totalSize) {
+          logProgressWithRate("IMG", sentBytes, totalSize, transferStart);
         }
       }
 
@@ -390,12 +457,7 @@ void imageTask(void *param) {
   vTaskDelete(NULL);
 }
 
-
-
-// ============================================================================
 // Audio Task
-// ============================================================================
-
 void audioTask(void *param) {
   uint8_t req;
   unsigned long lastCaptureMs = 0;
@@ -462,9 +524,9 @@ void audioTask(void *param) {
             chunkCount++;
             vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
             
-            // Log progress every 20 chunks or at the end
-            if (chunkCount % 20 == 0 || sentBytes >= wav_size) {
-              logProgress("AUD", sentBytes, wav_size);
+            // Log progress every 10 chunks or at the end with visual progress bar
+            if (chunkCount % 10 == 0 || sentBytes >= wav_size) {
+              logProgressWithRate("AUD", sentBytes, wav_size, transferStart);
             }
         }
 
@@ -495,6 +557,246 @@ void audioTask(void *param) {
           logDebug("AUD", "Drained " + String(drained) + " queued requests");
         }
       }
+  }
+  // Task cleanly stop itself when it no longer needs to run, freeing resources
+  vTaskDelete(NULL);
+}
+
+// Background Audio Recording Task for VQA
+void backgroundAudioRecordingTask(void *param) {
+  logInfo("VQA-AUD", "Background audio recording task started");
+  
+  // Record audio for 5 seconds
+  size_t audioBufferSize = 0;
+  vqaState.audioBuffer = i2s.recordWAV(3, &audioBufferSize);
+  vqaState.audioSize = audioBufferSize;
+  
+  unsigned long audioRecordTime = millis() - vqaState.audioRecordingStartTime;
+  vqaState.audioRecordingInProgress = false;
+  vqaState.audioRecordingComplete = true;
+  
+  if (vqaState.audioBuffer) {
+    logInfo("VQA-AUD", "Background audio recording completed: " + String(vqaState.audioSize) + 
+            " bytes (" + String(vqaState.audioSize/1024) + " KB) in " + String(audioRecordTime) + "ms");
+  } else {
+    logError("VQA-AUD", "Background audio recording failed");
+  }
+  
+  // Task auto-cleanup
+  vqaState.backgroundAudioTaskHandle = nullptr;
+  vTaskDelete(NULL);
+}
+
+// VQA Task - Coordinates Image + Audio
+void vqaTask(void *param) {
+  uint8_t req;
+  unsigned long lastCaptureMs = 0;
+
+  logInfo("TASK", "VQA task started");
+
+  for (;;) {
+    // Wait for VQA request
+    if (xQueueReceive(vqaQueue, &req, portMAX_DELAY) == pdTRUE) {
+
+      // Debounce too fast command requests
+      unsigned long now = millis();
+      if (now - lastCaptureMs < CAPTURE_DEBOUNCE_MS) {
+        logWarn("VQA", "Request debounced (too frequent)");
+        continue;
+      }
+      lastCaptureMs = now;
+
+      // BLE Connection Check
+      if (!deviceConnected) {
+        logWarn("VQA", "No BLE client connected - skipping VQA");
+        continue;
+      }
+
+      logInfo("VQA", "Starting VQA operation (Image + Audio)...");
+      logMemory("VQA");
+
+      // Reset VQA state
+      vqaState.imageTransmissionComplete = false;
+      vqaState.audioRecordingInProgress = false;
+      vqaState.audioRecordingComplete = false;
+      if (vqaState.audioBuffer) {
+        delete[] vqaState.audioBuffer;
+        vqaState.audioBuffer = nullptr;
+      }
+      vqaState.audioSize = 0;
+
+      // Step 1: Start background audio recording task
+      logInfo("VQA", "Starting background audio recording task...");
+      vqaState.audioRecordingInProgress = true;
+      vqaState.audioRecordingStartTime = millis();
+      
+      BaseType_t audioTaskResult = xTaskCreatePinnedToCore(
+        backgroundAudioRecordingTask, 
+        "VQA_AudioTask", 
+        8192, 
+        nullptr, 
+        2, // Higher priority than VQA task
+        &vqaState.backgroundAudioTaskHandle, 
+        0  // Run on core 0
+      );
+      
+      if (audioTaskResult != pdPASS) {
+        logError("VQA", "Failed to create background audio recording task");
+        continue;
+      }
+
+      // Step 2: Capture image while audio is recording in background
+      logInfo("VQA", "Starting image capture (audio recording in background)...");
+      
+      // Take picture
+      camera_fb_t *fb = esp_camera_fb_get();
+      
+      // Retry once if first capture fails
+      if (!fb) {
+        logWarn("VQA", "First capture failed, retrying...");
+        vTaskDelay(pdMS_TO_TICKS(50));
+        fb = esp_camera_fb_get();
+        if (!fb) {
+          logError("VQA", "Camera capture failed after retry");
+          // Wait for audio task to complete and clean up
+          while (vqaState.audioRecordingInProgress) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+          }
+          if (vqaState.audioBuffer) {
+            delete[] vqaState.audioBuffer;
+            vqaState.audioBuffer = nullptr;
+          }
+          continue;
+        }
+      }
+
+      size_t imageSize = fb->len;
+      uint8_t *imageBuffer = fb->buf;
+      logInfo("VQA", "Captured " + String(imageSize) + " bytes (" + 
+              String(imageSize/1024) + " KB) - Audio still recording in background");
+
+      // Step 3: Send image data via BLE (while audio continues recording)
+      logInfo("VQA", "Starting image transmission (audio recording in background)...");
+      
+      // Image header
+      String imageHeader = "VQA_IMG_START:" + String(imageSize);
+      pCharacteristic->setValue((uint8_t*)imageHeader.c_str(), imageHeader.length());
+      pCharacteristic->notify();
+      vTaskDelay(pdMS_TO_TICKS(20));
+      logDebug("VQA", "Image header sent: " + imageHeader);
+
+      // Send image chunks
+      size_t sentBytes = 0;
+      size_t chunkCount = 0;
+      unsigned long transferStart = millis();
+      
+      for (size_t i = 0; i < imageSize; i += negotiatedChunkSize) {
+        int len = (i + negotiatedChunkSize > imageSize) ? (imageSize - i) : negotiatedChunkSize;
+        pCharacteristic->setValue(imageBuffer + i, len);
+        pCharacteristic->notify();
+        sentBytes += len;
+        chunkCount++;
+        vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
+        
+        // Log progress every 10 chunks or at the end with visual progress bar
+        if (chunkCount % 10 == 0 || sentBytes >= imageSize) {
+          logProgressWithRate("VQA-IMG", sentBytes, imageSize, transferStart);
+        }
+      }
+
+      unsigned long imageTransferTime = millis() - transferStart;
+      float imageTransferRate = (imageSize / 1024.0) / (imageTransferTime / 1000.0);
+      
+      // Image footer
+      String imageFooter = "VQA_IMG_END";
+      pCharacteristic->setValue((uint8_t*)imageFooter.c_str(), imageFooter.length());
+      pCharacteristic->notify();
+      vTaskDelay(pdMS_TO_TICKS(20));
+      logDebug("VQA", "Image footer sent: " + imageFooter);
+
+      logInfo("VQA", "Image transfer complete in " + String(imageTransferTime) + 
+              "ms (" + String(imageTransferRate, 1) + " KB/s)");
+
+      // Release camera frame buffer
+      esp_camera_fb_return(fb);
+      vqaState.imageTransmissionComplete = true;
+
+      // Step 4: Wait for audio recording to complete (if still in progress)
+      if (vqaState.audioRecordingInProgress) {
+        logInfo("VQA", "Waiting for audio recording to complete...");
+        while (vqaState.audioRecordingInProgress && !vqaState.audioRecordingComplete) {
+          vTaskDelay(pdMS_TO_TICKS(50));
+        }
+      }
+
+      // Step 5: Send audio data via BLE
+      if (vqaState.audioRecordingComplete && vqaState.audioBuffer && vqaState.audioSize > 0) {
+        logInfo("VQA", "Starting audio transmission...");
+        
+        // Audio header
+        String audioHeader = "VQA_AUD_START:" + String(vqaState.audioSize);
+        pCharacteristic->setValue((uint8_t*)audioHeader.c_str(), audioHeader.length());
+        pCharacteristic->notify();
+        vTaskDelay(pdMS_TO_TICKS(20));
+        logDebug("VQA", "Audio header sent: " + audioHeader);
+
+        // Send audio chunks
+        sentBytes = 0;
+        chunkCount = 0;
+        transferStart = millis();
+        
+        for (size_t i = 0; i < vqaState.audioSize; i += negotiatedChunkSize) {
+          int len = (i + negotiatedChunkSize > vqaState.audioSize) ? (vqaState.audioSize - i) : negotiatedChunkSize;
+          pCharacteristic->setValue(vqaState.audioBuffer + i, len);
+          pCharacteristic->notify();
+          sentBytes += len;
+          chunkCount++;
+          vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
+          
+          // Log progress every 10 chunks or at the end with visual progress bar
+          if (chunkCount % 10 == 0 || sentBytes >= vqaState.audioSize) {
+            logProgressWithRate("VQA-AUD", sentBytes, vqaState.audioSize, transferStart);
+          }
+        }
+
+        unsigned long audioTransferTime = millis() - transferStart;
+        float audioTransferRate = (vqaState.audioSize / 1024.0) / (audioTransferTime / 1000.0);
+
+        // Audio footer
+        String audioFooter = "VQA_AUD_END";
+        pCharacteristic->setValue((uint8_t*)audioFooter.c_str(), audioFooter.length());
+        pCharacteristic->notify();
+        logDebug("VQA", "Audio footer sent: " + audioFooter);
+
+        logInfo("VQA", "Audio transfer complete in " + String(audioTransferTime) + 
+                "ms (" + String(audioTransferRate, 1) + " KB/s)");
+
+        // Clean up audio buffer
+        delete[] vqaState.audioBuffer;
+        vqaState.audioBuffer = nullptr;
+        vqaState.audioSize = 0;
+      } else {
+        logWarn("VQA", "Audio recording failed or no audio data available");
+      }
+
+      // Send VQA completion signal
+      String vqaComplete = "VQA_COMPLETE";
+      pCharacteristic->setValue((uint8_t*)vqaComplete.c_str(), vqaComplete.length());
+      pCharacteristic->notify();
+      logInfo("VQA", "VQA operation completed successfully");
+
+      logMemory("VQA");
+
+      // Drain extra queued requests
+      uint8_t drain;
+      int drained = 0;
+      while (xQueueReceive(vqaQueue, &drain, 0) == pdTRUE) {
+        drained++;
+      }
+      if (drained > 0) {
+        logDebug("VQA", "Drained " + String(drained) + " queued requests");
+      }
+    }
   }
   // Task cleanly stop itself when it no longer needs to run, freeing resources
   vTaskDelete(NULL);
@@ -550,6 +852,13 @@ void setup() {
     } else {
       logError("SYS", "Failed to create audio queue");
     }
+    
+    vqaQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
+    if (vqaQueue) {
+      logInfo("SYS", "VQA queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
+    } else {
+      logError("SYS", "Failed to create VQA queue");
+    }
 
     // Create Tasks
     BaseType_t result1 = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
@@ -564,6 +873,13 @@ void setup() {
       logInfo("SYS", "Audio task created on core 1");
     } else {
       logError("SYS", "Failed to create audio task");
+    }
+    
+    BaseType_t result3 = xTaskCreatePinnedToCore(vqaTask, "VQATask", 20480, nullptr, 1, &vqaTaskHandle, 1);
+    if (result3 == pdPASS) {
+      logInfo("SYS", "VQA task created on core 1");
+    } else {
+      logError("SYS", "Failed to create VQA task");
     }
     
     logInfo("SYS", "=== System initialization complete ===");
@@ -609,6 +925,14 @@ void loop() {
       } else {
         logWarn("CMD", "Audio queue full - request ignored");
       }
+    } 
+    else if (cmd == "VQA") {
+      uint8_t token = 1;
+      if (xQueueSend(vqaQueue, &token, 0) == pdTRUE) {
+        logInfo("CMD", "VQA operation queued via serial");
+      } else {
+        logWarn("CMD", "VQA queue full - request ignored");
+      }
     }
     else if (cmd == "STATUS") {
       logInfo("SYS", "=== System Status ===");
@@ -616,6 +940,7 @@ void loop() {
       logInfo("SYS", "Chunk size: " + String(negotiatedChunkSize) + " bytes");
       logInfo("SYS", "Image queue: " + String(uxQueueSpacesAvailable(imageQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
       logInfo("SYS", "Audio queue: " + String(uxQueueSpacesAvailable(audioQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
+      logInfo("SYS", "VQA queue: " + String(uxQueueSpacesAvailable(vqaQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
       logMemory("SYS");
     }
     else if (cmd == "DEBUG") {
@@ -624,7 +949,7 @@ void loop() {
     }
     else if (cmd.length() > 0) {
       logWarn("CMD", "Unknown serial command: '" + cmd + "'");
-      logInfo("CMD", "Available commands: IMAGE, AUDIO, STATUS, DEBUG");
+      logInfo("CMD", "Available commands: IMAGE, AUDIO, VQA, STATUS, DEBUG");
     }
   }
   delay(10);
