@@ -8,7 +8,6 @@
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-#define CAPTURE_QUEUE_LEN   1
 #define CAPTURE_DEBOUNCE_MS 500
 #define SEND_DELAY_BETWEEN_CHUNKS_MS 15
 
@@ -28,8 +27,7 @@ BLECharacteristic* pCharacteristic;
 int negotiatedChunkSize = 23;
 I2SClass i2s;
 
-// Task handles and queues
-QueueHandle_t imageQueue = nullptr;
+// Task handles for on-demand tasks
 TaskHandle_t imageTaskHandle = nullptr;
 
 // Audio streaming state
@@ -215,12 +213,18 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
 
     // Commands
     else if (value == "IMAGE") {
-      if (systemInitialized && imageQueue) {
-        uint8_t token = 1;
-        if (xQueueSend(imageQueue, &token, 0) == pdTRUE) {
-          logInfo("CMD", "Image capture queued");
+      if (systemInitialized) {
+        // Check if image task is already running
+        if (imageTaskHandle != nullptr) {
+          logWarn("CMD", "Image capture already in progress");
         } else {
-          logWarn("CMD", "Image capture ignored - queue full");
+          // Create image capture task on-demand
+          BaseType_t result = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
+          if (result == pdPASS) {
+            logInfo("CMD", "Image capture task created");
+          } else {
+            logError("CMD", "Failed to create image capture task");
+          }
         }
       } else {
         logWarn("CMD", "Image capture ignored - system not initialized");
@@ -317,22 +321,6 @@ void initializeSystem() {
   // Initialize Microphone
   initMicrophone();
 
-  // Create Queues
-  imageQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
-  if (imageQueue) {
-    logInfo("SYS", "Image queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
-  } else {
-    logError("SYS", "Failed to create image queue");
-  }
-
-  // Create Tasks
-  BaseType_t result1 = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
-  if (result1 == pdPASS) {
-    logInfo("SYS", "Image task created on core 1");
-  } else {
-    logError("SYS", "Failed to create image task");
-  }
-  
   systemInitialized = true;
   logInfo("SYS", "========================== System initialization complete ==========================");
   Serial.println();
@@ -384,13 +372,6 @@ void cleanupSystem() {
   vqaState.audioStreamingActive = false;
   vqaState.totalAudioStreamed = 0;
   vqaState.audioRecordingStartTime = 0;
-  
-  // Delete queues
-  if (imageQueue) {
-    vQueueDelete(imageQueue);
-    imageQueue = nullptr;
-    logInfo("SYS", "Image queue deleted");
-  }
   
   // Deinitialize camera
   esp_camera_deinit();
@@ -531,114 +512,94 @@ void initBLE() {
 
 
 // ============================================================================
-// FreeOTS Tasks
+// FreeRTOS Tasks - On-Demand Creation
 // ============================================================================
 
-// Image Task
+// Image Task - One-shot capture task (created on-demand)
 void imageTask(void *param) {
-  uint8_t req;
-  unsigned long lastCaptureMs = 0;
+  logInfo("TASK", "Image capture task started");
 
-  logInfo("TASK", "Image task started");
+  // BLE Connection Check
+  if (!deviceConnected) {
+    logWarn("IMG", "No BLE client connected - skipping capture");
+    imageTaskHandle = nullptr;
+    vTaskDelete(NULL);
+    return;
+  }
 
-  for (;;) {
-    // Wait for image capture request
-    if (xQueueReceive(imageQueue, &req, portMAX_DELAY) == pdTRUE) {
+  logInfo("IMG", "Starting image capture...");
+  logMemory("IMG");
 
-      // Debounce too fast command requests, avoid spamming
-      unsigned long now = millis();
-      if (now - lastCaptureMs < CAPTURE_DEBOUNCE_MS) {
-        logWarn("IMG", "Request debounced (too frequent)");
-        continue;
-      }
-      lastCaptureMs = now;
+  // Take picture
+  camera_fb_t *fb = esp_camera_fb_get();
 
-      // BLE Connection Check
-      if (!deviceConnected) {
-        logWarn("IMG", "No BLE client connected - skipping capture");
-        continue;
-      }
-
-      logInfo("IMG", "Starting image capture...");
-      logMemory("IMG");
-
-      // Take picture
-      camera_fb_t *fb = esp_camera_fb_get();
-
-      // Force fresh frame. It retries once to get a camera frame and skips if capture still fails.
-      if (!fb) {
-        logWarn("IMG", "First capture failed, retrying...");
-        vTaskDelay(pdMS_TO_TICKS(50));
-        fb = esp_camera_fb_get();
-        if (!fb) {
-          logError("IMG", "Camera capture failed after retry");
-          continue;
-        }
-      }
-
-      // Takes the frame captured by the camera, extracts its size and data buffer, and then logs the size for debugging.
-      size_t totalSize = fb->len;
-      uint8_t *buffer = fb->buf;
-      logInfo("IMG", "Captured " + String(totalSize) + " bytes (" + 
-              String(totalSize/1024) + " KB)");
-
-      // ------------------------------------------------------------------------------------------
-      // Send Image Data
-      // ------------------------------------------------------------------------------------------
-      logInfo("IMG", "Starting BLE transmission...");
-      
-      // Header
-      String header = "IMG_START:" + String(totalSize);
-      pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
-      pCharacteristic->notify();
-      vTaskDelay(pdMS_TO_TICKS(20));
-      logDebug("IMG", "Header sent: " + header);
-
-      // Chunks
-      size_t sentBytes = 0;
-      size_t chunkCount = 0;
-      unsigned long transferStart = millis();
-      
-      for (size_t i = 0; i < totalSize; i += negotiatedChunkSize) {
-        int len = (i + negotiatedChunkSize > totalSize) ? (totalSize - i) : negotiatedChunkSize;
-        pCharacteristic->setValue(buffer + i, len);
-        pCharacteristic->notify();
-        sentBytes += len;
-        chunkCount++;
-        vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
-        
-        logProgressRate("IMG", sentBytes, totalSize, transferStart);
-      }
-
-      unsigned long transferTime = millis() - transferStart;
-      float transferRate = (totalSize / 1024.0) / (transferTime / 1000.0);
-      
-      // Footer
-      String footer = "IMG_END";
-      pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
-      pCharacteristic->notify();
-      logDebug("IMG", "Footer sent: " + footer);
-      // ------------------------------------------------------------------------------------------
-
-      logInfo("IMG", "Transfer complete in " + String(transferTime) + 
-              "ms (" + String(transferRate, 1) + " KB/s)");
-
-      // Release memory when done
-      esp_camera_fb_return(fb);
-      logMemory("IMG");
-
-      // Drain extra queued requests
-      uint8_t drain;
-      int drained = 0;
-      while (xQueueReceive(imageQueue, &drain, 0) == pdTRUE) {
-        drained++;
-      }
-      if (drained > 0) {
-        logDebug("IMG", "Drained " + String(drained) + " queued requests");
-      }
+  // Force fresh frame. It retries once to get a camera frame and skips if capture still fails.
+  if (!fb) {
+    logWarn("IMG", "First capture failed, retrying...");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      logError("IMG", "Camera capture failed after retry");
+      imageTaskHandle = nullptr;
+      vTaskDelete(NULL);
+      return;
     }
   }
-  // Task cleanly stop itself when it no longer needs to run, freeing resources
+
+  // Takes the frame captured by the camera, extracts its size and data buffer, and then logs the size for debugging.
+  size_t totalSize = fb->len;
+  uint8_t *buffer = fb->buf;
+  logInfo("IMG", "Captured " + String(totalSize) + " bytes (" + 
+          String(totalSize/1024) + " KB)");
+
+  // ------------------------------------------------------------------------------------------
+  // Send Image Data
+  // ------------------------------------------------------------------------------------------
+  logInfo("IMG", "Starting BLE transmission...");
+  
+  // Header
+  String header = "IMG_START:" + String(totalSize);
+  pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
+  pCharacteristic->notify();
+  vTaskDelay(pdMS_TO_TICKS(20));
+  logDebug("IMG", "Header sent: " + header);
+
+  // Chunks
+  size_t sentBytes = 0;
+  size_t chunkCount = 0;
+  unsigned long transferStart = millis();
+  
+  for (size_t i = 0; i < totalSize; i += negotiatedChunkSize) {
+    int len = (i + negotiatedChunkSize > totalSize) ? (totalSize - i) : negotiatedChunkSize;
+    pCharacteristic->setValue(buffer + i, len);
+    pCharacteristic->notify();
+    sentBytes += len;
+    chunkCount++;
+    vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
+    
+    logProgressRate("IMG", sentBytes, totalSize, transferStart);
+  }
+
+  unsigned long transferTime = millis() - transferStart;
+  float transferRate = (totalSize / 1024.0) / (transferTime / 1000.0);
+  
+  // Footer
+  String footer = "IMG_END";
+  pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
+  pCharacteristic->notify();
+  logDebug("IMG", "Footer sent: " + footer);
+  // ------------------------------------------------------------------------------------------
+
+  logInfo("IMG", "Transfer complete in " + String(transferTime) + 
+          "ms (" + String(transferRate, 1) + " KB/s)");
+
+  // Release memory when done
+  esp_camera_fb_return(fb);
+  logMemory("IMG");
+
+  // Clean up task handle and delete task
+  imageTaskHandle = nullptr;
+  logInfo("IMG", "Image capture task completed");
   vTaskDelete(NULL);
 }
 
@@ -1092,12 +1053,18 @@ void loop() {
     if (cmd == "IMAGE") {
       if (!deviceConnected) {
         logWarn("CMD", "Image capture ignored - BLE not connected");
-      } else if (systemInitialized && imageQueue) {
-        uint8_t token = 1;
-        if (xQueueSend(imageQueue, &token, 0) == pdTRUE) {
-          logInfo("CMD", "Image capture queued via serial");
+      } else if (systemInitialized) {
+        // Check if image task is already running
+        if (imageTaskHandle != nullptr) {
+          logWarn("CMD", "Image capture already in progress");
         } else {
-          logWarn("CMD", "Image queue full - request ignored");
+          // Create image capture task on-demand
+          BaseType_t result = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
+          if (result == pdPASS) {
+            logInfo("CMD", "Image capture task created via serial");
+          } else {
+            logError("CMD", "Failed to create image capture task via serial");
+          }
         }
       } else {
         logWarn("CMD", "Image capture ignored - system not initialized");
@@ -1180,11 +1147,6 @@ void loop() {
       logInfo("SYS", "BLE connected: " + String(deviceConnected ? "Yes" : "No"));
       logInfo("SYS", "System initialized: " + String(systemInitialized ? "Yes" : "No"));
       logInfo("SYS", "Chunk size: " + String(negotiatedChunkSize) + " bytes");
-      if (systemInitialized) {
-        logInfo("SYS", "Image queue: " + String(uxQueueSpacesAvailable(imageQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
-      } else {
-        logInfo("SYS", "Queues: Not initialized");
-      }
       logMemory("SYS");
     }
     else if (cmd == "DEBUG") {
