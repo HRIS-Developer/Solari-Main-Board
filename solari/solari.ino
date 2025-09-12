@@ -19,6 +19,7 @@
 // ============================================================================
 
 bool deviceConnected = false;
+bool systemInitialized = false;
 BLECharacteristic* pCharacteristic;
 int negotiatedChunkSize = 23;
 I2SClass i2s;
@@ -136,13 +137,26 @@ void logProgressRate(const String &component, size_t current, size_t total, unsi
 
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) override {
-    logInfo("BLE", "Client connected");
+    Serial.println();
+    logInfo("BLE", "!! Client connected !!");
     deviceConnected = true;
     logMemory("BLE");
+    
+    // Initialize system components when connected
+    if (!systemInitialized) {
+      initializeSystem();
+    }
   }
   void onDisconnect(BLEServer* pServer) override {
-    logWarn("BLE", "Client disconnected");
+    Serial.println();
+    logWarn("BLE", "!! Client disconnected !!");
     deviceConnected = false;
+    
+    // Clean up system components when disconnected
+    if (systemInitialized) {
+      cleanupSystem();
+    }
+    
     BLEDevice::startAdvertising();
     logInfo("BLE", "Advertising restarted");
   }
@@ -154,13 +168,14 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
     value.trim();
     value.toUpperCase();
 
+    // Raw Inputs
     logDebug("BLE", "Raw received: '" + value + "'");
 
     // MTU Change
     if (value.startsWith("MTU:")) {
       int mtu = value.substring(4).toInt();
-      if (mtu >= 23 && mtu <= 512) {
-        negotiatedChunkSize = max(20, mtu);
+      if (mtu >= 23 && mtu <= 517) {
+        negotiatedChunkSize = max(20, mtu - 3);
         logInfo("BLE", "MTU negotiated: " + String(mtu) + 
                " bytes, chunk size: " + String(negotiatedChunkSize) + " bytes");
       } else {
@@ -170,27 +185,39 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
 
     // Commands
     else if (value == "IMAGE") {
-      uint8_t token = 1;
-      if (imageQueue && xQueueSend(imageQueue, &token, 0) == pdTRUE) {
-        logInfo("CMD", "Image capture queued");
+      if (systemInitialized && imageQueue) {
+        uint8_t token = 1;
+        if (xQueueSend(imageQueue, &token, 0) == pdTRUE) {
+          logInfo("CMD", "Image capture queued");
+        } else {
+          logWarn("CMD", "Image capture ignored - queue full");
+        }
       } else {
-        logWarn("CMD", "Image capture ignored - queue full");
+        logWarn("CMD", "Image capture ignored - system not initialized");
       }
     }
     else if (value == "AUDIO") {
-      uint8_t token = 1;
-      if (audioQueue && xQueueSend(audioQueue, &token, 0) == pdTRUE) {
-        logInfo("CMD", "Audio recording queued");
+      if (systemInitialized && audioQueue) {
+        uint8_t token = 1;
+        if (xQueueSend(audioQueue, &token, 0) == pdTRUE) {
+          logInfo("CMD", "Audio recording queued");
+        } else {
+          logWarn("CMD", "Audio capture ignored - queue full");
+        }
       } else {
-        logWarn("CMD", "Audio capture ignored - queue full");
+        logWarn("CMD", "Audio capture ignored - system not initialized");
       }
     }
     else if (value == "VQA") {
-      uint8_t token = 1;
-      if (vqaQueue && xQueueSend(vqaQueue, &token, 0) == pdTRUE) {
-        logInfo("CMD", "VQA operation queued");
+      if (systemInitialized && vqaQueue) {
+        uint8_t token = 1;
+        if (xQueueSend(vqaQueue, &token, 0) == pdTRUE) {
+          logInfo("CMD", "VQA operation queued");
+        } else {
+          logWarn("CMD", "VQA operation ignored - queue full");
+        }
       } else {
-        logWarn("CMD", "VQA operation ignored - queue full");
+        logWarn("CMD", "VQA operation ignored - system not initialized");
       }
     }
     else {
@@ -198,6 +225,151 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
     }
   }
 };
+
+
+
+// ============================================================================
+// System Initialization and Cleanup
+// ============================================================================
+
+// Initialize and setup all components
+void initializeSystem() {
+  Serial.println();
+  logInfo("SYS", "========================== Initializing system components ==========================");
+  
+  // Initialize Camera
+  initCamera();
+
+  // Initialize Microphone
+  initMicrophone();
+
+  // Create Queues
+  imageQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
+  if (imageQueue) {
+    logInfo("SYS", "Image queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
+  } else {
+    logError("SYS", "Failed to create image queue");
+  }
+  
+  audioQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
+  if (audioQueue) {
+    logInfo("SYS", "Audio queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
+  } else {
+    logError("SYS", "Failed to create audio queue");
+  }
+  
+  vqaQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
+  if (vqaQueue) {
+    logInfo("SYS", "VQA queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
+  } else {
+    logError("SYS", "Failed to create VQA queue");
+  }
+
+  // Create Tasks
+  BaseType_t result1 = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
+  if (result1 == pdPASS) {
+    logInfo("SYS", "Image task created on core 1");
+  } else {
+    logError("SYS", "Failed to create image task");
+  }
+  
+  BaseType_t result2 = xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, nullptr, 1, &audioTaskHandle, 1);
+  if (result2 == pdPASS) {
+    logInfo("SYS", "Audio task created on core 1");
+  } else {
+    logError("SYS", "Failed to create audio task");
+  }
+  
+  BaseType_t result3 = xTaskCreatePinnedToCore(vqaTask, "VQATask", 20480, nullptr, 1, &vqaTaskHandle, 1);
+  if (result3 == pdPASS) {
+    logInfo("SYS", "VQA task created on core 1");
+  } else {
+    logError("SYS", "Failed to create VQA task");
+  }
+  
+  systemInitialized = true;
+  logInfo("SYS", "========================== System initialization complete ==========================");
+  Serial.println();
+  logMemory("SYS");
+}
+
+// Cleanup and free all resources
+void cleanupSystem() {
+  Serial.println();
+  logInfo("SYS", "========================== Cleaning up system components ==========================");
+  
+  // Delete tasks
+  if (imageTaskHandle) {
+    vTaskDelete(imageTaskHandle);
+    imageTaskHandle = nullptr;
+    logInfo("SYS", "Image task deleted");
+  }
+  
+  if (audioTaskHandle) {
+    vTaskDelete(audioTaskHandle);
+    audioTaskHandle = nullptr;
+    logInfo("SYS", "Audio task deleted");
+  }
+  
+  if (vqaTaskHandle) {
+    vTaskDelete(vqaTaskHandle);
+    vqaTaskHandle = nullptr;
+    logInfo("SYS", "VQA task deleted");
+  }
+  
+  // Clean up VQA background task if running
+  if (vqaState.backgroundAudioTaskHandle) {
+    vTaskDelete(vqaState.backgroundAudioTaskHandle);
+    vqaState.backgroundAudioTaskHandle = nullptr;
+    logInfo("SYS", "VQA background audio task deleted");
+  }
+  
+  // Clean up VQA audio buffer if allocated
+  if (vqaState.audioBuffer) {
+    delete[] vqaState.audioBuffer;
+    vqaState.audioBuffer = nullptr;
+    vqaState.audioSize = 0;
+    logInfo("SYS", "VQA audio buffer freed");
+  }
+  
+  // Reset VQA state
+  vqaState.imageTransmissionComplete = false;
+  vqaState.audioRecordingInProgress = false;
+  vqaState.audioRecordingComplete = false;
+  vqaState.audioRecordingStartTime = 0;
+  
+  // Delete queues
+  if (imageQueue) {
+    vQueueDelete(imageQueue);
+    imageQueue = nullptr;
+    logInfo("SYS", "Image queue deleted");
+  }
+  
+  if (audioQueue) {
+    vQueueDelete(audioQueue);
+    audioQueue = nullptr;
+    logInfo("SYS", "Audio queue deleted");
+  }
+  
+  if (vqaQueue) {
+    vQueueDelete(vqaQueue);
+    vqaQueue = nullptr;
+    logInfo("SYS", "VQA queue deleted");
+  }
+  
+  // Deinitialize camera
+  esp_camera_deinit();
+  logInfo("SYS", "Camera deinitialized");
+  
+  // Stop I2S (microphone)
+  i2s.end();
+  logInfo("SYS", "Microphone deinitialized");
+  
+  systemInitialized = false;
+  logInfo("SYS", "========================== System cleanup complete ==========================");
+  Serial.println();
+  logMemory("SYS");
+}
 
 
 
@@ -250,7 +422,6 @@ void initCamera() {
   config.fb_count = psramFound() ? 2 : 1;
 
   logDebug("CAM", "PSRAM found: " + String(psramFound() ? "Yes" : "No"));
-  logDebug("CAM", "Frame size: HD (1280x720), JPEG quality: " + String(config.jpeg_quality));
 
   if (esp_camera_init(&config) != ESP_OK) {
     logError("CAM", "Camera initialization failed!");
@@ -291,6 +462,9 @@ void initMicrophone() {
 // ============================================================================
 
 void initBLE() {
+    Serial.println();
+    logInfo("SYS", "========================== Initializing Bluetooth Connection ==========================");
+
     logInfo("BLE", "Initializing Bluetooth LE...");
     
     BLEDevice::init("XIAO_ESP32S3");
@@ -314,6 +488,9 @@ void initBLE() {
     logInfo("BLE", "Ready and advertising as 'XIAO_ESP32S3'");
     logDebug("BLE", "Service UUID: " + String(SERVICE_UUID));
     logMemory("BLE");
+
+    logInfo("SYS", "========================== BLE initialization complete - waiting for connections ==========================");
+    Serial.println();
 }
 
 
@@ -781,66 +958,10 @@ void setup() {
     logInfo("SYS", "Compile time: " + String(__DATE__) + " " + String(__TIME__));
     logMemory("SYS");
 
-    // Initialize BLE
+    // Initialize BLE only
     initBLE();
 
-    // Wait for BLE connection before continuing
-    logInfo("SYS", "Waiting for BLE connection...");
-    while (!deviceConnected) {
-        delay(100);
-    }
-
-    // Initialize Camera
-    initCamera();
-
-    // Initialize Microphone
-    initMicrophone();
-
-    // Create Queues
-    imageQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
-    if (imageQueue) {
-      logInfo("SYS", "Image queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
-    } else {
-      logError("SYS", "Failed to create image queue");
-    }
-    
-    audioQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
-    if (audioQueue) {
-      logInfo("SYS", "Audio queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
-    } else {
-      logError("SYS", "Failed to create audio queue");
-    }
-    
-    vqaQueue = xQueueCreate(CAPTURE_QUEUE_LEN, sizeof(uint8_t)); 
-    if (vqaQueue) {
-      logInfo("SYS", "VQA queue created (size: " + String(CAPTURE_QUEUE_LEN) + ")");
-    } else {
-      logError("SYS", "Failed to create VQA queue");
-    }
-
-    // Create Tasks
-    BaseType_t result1 = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
-    if (result1 == pdPASS) {
-      logInfo("SYS", "Image task created on core 1");
-    } else {
-      logError("SYS", "Failed to create image task");
-    }
-    
-    BaseType_t result2 = xTaskCreatePinnedToCore(audioTask, "AudioTask", 16384, nullptr, 1, &audioTaskHandle, 1);
-    if (result2 == pdPASS) {
-      logInfo("SYS", "Audio task created on core 1");
-    } else {
-      logError("SYS", "Failed to create audio task");
-    }
-    
-    BaseType_t result3 = xTaskCreatePinnedToCore(vqaTask, "VQATask", 20480, nullptr, 1, &vqaTaskHandle, 1);
-    if (result3 == pdPASS) {
-      logInfo("SYS", "VQA task created on core 1");
-    } else {
-      logError("SYS", "Failed to create VQA task");
-    }
-    
-    logInfo("SYS", "=== System initialization complete ===");
+    logInfo("SYS", "System components will be initialized when a client connects");
     logMemory("SYS");
 }
 
@@ -877,42 +998,65 @@ void loop() {
 
   // !! TEMPORARY !!
   // Serial Commands for testing
-  if (deviceConnected && Serial.available()) {
+  if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     cmd.toUpperCase();
 
     if (cmd == "IMAGE") {
-      uint8_t token = 1;
-      if (xQueueSend(imageQueue, &token, 0) == pdTRUE) {
-        logInfo("CMD", "Image capture queued via serial");
+      if (!deviceConnected) {
+        logWarn("CMD", "Image capture ignored - BLE not connected");
+      } else if (systemInitialized && imageQueue) {
+        uint8_t token = 1;
+        if (xQueueSend(imageQueue, &token, 0) == pdTRUE) {
+          logInfo("CMD", "Image capture queued via serial");
+        } else {
+          logWarn("CMD", "Image queue full - request ignored");
+        }
       } else {
-        logWarn("CMD", "Image queue full - request ignored");
+        logWarn("CMD", "Image capture ignored - system not initialized");
       }
     } 
     else if (cmd == "AUDIO") {
-      uint8_t token = 1;
-      if (xQueueSend(audioQueue, &token, 0) == pdTRUE) {
-        logInfo("CMD", "Audio recording queued via serial");
+      if (!deviceConnected) {
+        logWarn("CMD", "Audio capture ignored - BLE not connected");
+      } else if (systemInitialized && audioQueue) {
+        uint8_t token = 1;
+        if (xQueueSend(audioQueue, &token, 0) == pdTRUE) {
+          logInfo("CMD", "Audio recording queued via serial");
+        } else {
+          logWarn("CMD", "Audio queue full - request ignored");
+        }
       } else {
-        logWarn("CMD", "Audio queue full - request ignored");
+        logWarn("CMD", "Audio capture ignored - system not initialized");
       }
     } 
     else if (cmd == "VQA") {
-      uint8_t token = 1;
-      if (xQueueSend(vqaQueue, &token, 0) == pdTRUE) {
-        logInfo("CMD", "VQA operation queued via serial");
+      if (!deviceConnected) {
+        logWarn("CMD", "VQA operation ignored - BLE not connected");
+      } else if (systemInitialized && vqaQueue) {
+        uint8_t token = 1;
+        if (xQueueSend(vqaQueue, &token, 0) == pdTRUE) {
+          logInfo("CMD", "VQA operation queued via serial");
+        } else {
+          logWarn("CMD", "VQA queue full - request ignored");
+        }
       } else {
-        logWarn("CMD", "VQA queue full - request ignored");
+        logWarn("CMD", "VQA operation ignored - system not initialized");
       }
     }
     else if (cmd == "STATUS") {
       logInfo("SYS", "=== System Status ===");
       logInfo("SYS", "BLE connected: " + String(deviceConnected ? "Yes" : "No"));
+      logInfo("SYS", "System initialized: " + String(systemInitialized ? "Yes" : "No"));
       logInfo("SYS", "Chunk size: " + String(negotiatedChunkSize) + " bytes");
-      logInfo("SYS", "Image queue: " + String(uxQueueSpacesAvailable(imageQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
-      logInfo("SYS", "Audio queue: " + String(uxQueueSpacesAvailable(audioQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
-      logInfo("SYS", "VQA queue: " + String(uxQueueSpacesAvailable(vqaQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
+      if (systemInitialized) {
+        logInfo("SYS", "Image queue: " + String(uxQueueSpacesAvailable(imageQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
+        logInfo("SYS", "Audio queue: " + String(uxQueueSpacesAvailable(audioQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
+        logInfo("SYS", "VQA queue: " + String(uxQueueSpacesAvailable(vqaQueue)) + "/" + String(CAPTURE_QUEUE_LEN) + " free");
+      } else {
+        logInfo("SYS", "Queues: Not initialized");
+      }
       logMemory("SYS");
     }
     else if (cmd == "DEBUG") {
