@@ -11,25 +11,49 @@
 #define CAPTURE_DEBOUNCE_MS 500
 #define SEND_DELAY_BETWEEN_CHUNKS_MS 15
 
-// VQA streaming configuration
-#define VQA_STREAM_CHUNK_DURATION_MS 500  // 500ms chunks for VQA streaming
+#define VQA_STREAM_CHUNK_DURATION_MS 100  // 500ms chunks for VQA streaming
 #define VQA_STREAM_BUFFER_COUNT 4         // Number of buffers for smooth streaming
+
+
+
+// ============================================================================
+// Touch Globals
+// ============================================================================
+const int touch_pin = A5;        // Touch sensor pin
+const int led_pin = LED_BUILTIN; // On-board LED
+
+bool ledState = false;     // indicator LED state (mirrors vqa running)
+bool lastTouch = false;    // Previous touch state
+int threshold = 2000;      // Adjust based on your sensor values
+unsigned long lastTouchMillis = 0;
+const unsigned long TOUCH_DEBOUNCE_MS = 200; // extra safety debounce
+bool touchEnabled = true;  // Enable/disable touch commands
+
+
+
+// ============================================================================
+// Temperature Globals
+// ============================================================================
+float tempThreshold = 55.0; // °C limit before shutdown
+TaskHandle_t tempTaskHandle;
+bool tempMonitoringEnabled = true; // Enable/disable temperature monitoring
 
 
 
 // ============================================================================
 // BLE Globals
 // ============================================================================
-
 bool deviceConnected = false;
 bool systemInitialized = false;
 BLECharacteristic* pCharacteristic;
 int negotiatedChunkSize = 23;
 I2SClass i2s;
 
-// Task handles for VQA only
 
-// VQA state management
+
+// ============================================================================
+// VQA Globals
+// ============================================================================
 struct VQAState {
   bool isRunning = false;
   bool stopRequested = false;
@@ -234,6 +258,14 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
         logWarn("CMD", "No VQA streaming active to stop");
       }
     }
+    else if (value == "TEMP") {
+      tempMonitoringEnabled = !tempMonitoringEnabled;
+      logInfo("CMD", "Temperature monitoring " + String(tempMonitoringEnabled ? "enabled" : "disabled") + " (overheat protection always active)");
+    }
+    else if (value == "TOUCH") {
+      touchEnabled = !touchEnabled;
+      logInfo("CMD", "Touch commands " + String(touchEnabled ? "enabled" : "disabled"));
+    }
     else {
       logWarn("CMD", "Unknown command received: '" + value + "'");
     }
@@ -429,13 +461,17 @@ void initBLE() {
 
 
 // ============================================================================
-// FreeRTOS Tasks - VQA Only
+// FreeRTOS Tasks
 // ============================================================================
 
 // VQA Streaming Task - Audio First, Then Image After Stop
 void vqaStreamTask(void *param) {
   logInfo("VQA-STREAM", "VQA streaming task started (audio first, then image after stop)");
   
+  // Ensure LED reflects streaming state
+  digitalWrite(led_pin, HIGH);
+  ledState = true;
+
   // Initialize VQA streaming state
   vqaState.isRunning = true;
   vqaState.stopRequested = false;
@@ -473,6 +509,13 @@ void vqaStreamTask(void *param) {
   // ============================================================================
   logInfo("VQA-STREAM", "Starting continuous audio streaming...");
   
+  // Audio header
+  String audioHeader = "A_START";  // Audio stream start marker
+  pCharacteristic->setValue((uint8_t*)audioHeader.c_str(), audioHeader.length());
+  pCharacteristic->notify();
+  vTaskDelay(pdMS_TO_TICKS(20));
+  logDebug("VQA-STREAM", "Audio header sent");
+
   while (!vqaState.stopRequested && streamingSuccess && deviceConnected) {
     chunkNumber++;
     
@@ -556,7 +599,7 @@ void vqaStreamTask(void *param) {
   // ============================================================================
   // STEP 2: Capture and Send Image (only after audio streaming stops)
   // ============================================================================
-  if (streamingSuccess && deviceConnected && !vqaState.stopRequested) {
+  if (streamingSuccess && deviceConnected) {
     logInfo("VQA-STREAM", "Starting image capture after audio streaming stopped...");
     
     // Take picture
@@ -630,25 +673,6 @@ void vqaStreamTask(void *param) {
       // Release camera frame buffer
       esp_camera_fb_return(fb);
     }
-  } else if (vqaState.stopRequested && deviceConnected) {
-    // VQA was stopped - send minimal image protocol for consistency
-    logInfo("VQA-STREAM", "VQA stopped - sending empty image protocol");
-    
-    // Send empty image header (0 size)
-    String imageHeader = "I:0";
-    pCharacteristic->setValue((uint8_t*)imageHeader.c_str(), imageHeader.length());
-    pCharacteristic->notify();
-    vTaskDelay(pdMS_TO_TICKS(20));
-    logDebug("VQA-STREAM", "Empty image header sent");
-
-    // Send immediate image footer (no data)
-    String imageFooter = "I_END";
-    pCharacteristic->setValue((uint8_t*)imageFooter.c_str(), imageFooter.length());
-    pCharacteristic->notify();
-    vTaskDelay(pdMS_TO_TICKS(20));
-    logDebug("VQA-STREAM", "Empty image footer sent");
-    
-    logInfo("VQA-STREAM", "Empty image protocol complete (VQA stopped)");
   }
 
   // ============================================================================
@@ -689,9 +713,33 @@ void vqaStreamTask(void *param) {
   vqaState.isRunning = false;
   vqaState.stopRequested = false;
   vqaState.vqaTaskHandle = nullptr;
+
+  // Turn off indicator LED
+  digitalWrite(led_pin, LOW);
+  ledState = false;
   
   // Task auto-cleanup
   vTaskDelete(NULL);
+}
+
+// Temperature Task
+void temperatureTask(void *param) {
+  while (true) {
+    float currentTemp = temperatureRead();
+    
+    // Always check for overheat protection (even when monitoring disabled)
+    if (currentTemp > tempThreshold) {
+      logError("TEMP", "Overheat detected! Turning off Device");
+      esp_deep_sleep_start();
+    }
+    
+    // Only log when monitoring is enabled
+    if (tempMonitoringEnabled) {
+      logDebug("TEMP", "Current temperature: " + String(currentTemp, 1) + " °C");
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1000)); // check every 1 sec
+  }
 }
 
 
@@ -709,8 +757,17 @@ void setup() {
     logInfo("SYS", "Compile time: " + String(__DATE__) + " " + String(__TIME__));
     logMemory("SYS");
 
+    // Setup touch/LED pins
+    pinMode(led_pin, OUTPUT);
+    digitalWrite(led_pin, LOW);
+    pinMode(touch_pin, INPUT);
+
     // Initialize BLE only
     initBLE();
+
+    // Create task to monitor temperature (always active for overheat protection)
+    xTaskCreatePinnedToCore(temperatureTask, "temperatureTask", 4096, NULL, 1, &tempTaskHandle, 1);
+    logInfo("SYS", "Temperature monitoring task created (overheat protection always active)");
 
     logInfo("SYS", "System components will be initialized when a client connects");
     logMemory("SYS");
@@ -738,10 +795,63 @@ void loop() {
 
 
 
+  // -----------------------------
+  // Touch sensor handling (rising edge -> toggle VQA) for testing
+  // -----------------------------
+  if (touchEnabled) {
+    int touchValue = analogRead(touch_pin);
+    bool isTouched = (touchValue > threshold);
 
+    // Optional: debug touch values occasionally
+    static unsigned long lastTouchDebug = 0;
+    if (millis() - lastTouchDebug > 2000) {
+      lastTouchDebug = millis();
+      logDebug("TOUCH", "Value: " + String(touchValue));
+    }
 
-  // !! TEMPORARY !!
+    // Rising edge detection with debounce
+    if (isTouched && !lastTouch && (millis() - lastTouchMillis) > TOUCH_DEBOUNCE_MS) {
+      lastTouchMillis = millis();
+
+      // Toggle VQA start/stop
+      if (!deviceConnected) {
+        logWarn("TOUCH", "Touch ignored - BLE not connected");
+      } else if (!systemInitialized) {
+        logWarn("TOUCH", "Touch ignored - system not initialized");
+      } else {
+        if (!vqaState.isRunning) {
+          // Start VQA streaming (same logic as BLE/serial command)
+          vqaState.stopRequested = false;
+          BaseType_t result = xTaskCreatePinnedToCore(
+            vqaStreamTask, 
+            "VQAStreamTask", 
+            20480, 
+            nullptr, 
+            1, // Normal priority
+            &vqaState.vqaTaskHandle, 
+            1  // Core 1
+          );
+          if (result == pdPASS) {
+            logInfo("TOUCH", "VQA streaming started via touch");
+            digitalWrite(led_pin, HIGH);
+            ledState = true;
+          } else {
+            logError("TOUCH", "Failed to start VQA streaming task via touch");
+          }
+        } else {
+          // Request stop
+          vqaState.stopRequested = true;
+          logInfo("TOUCH", "VQA streaming stop requested via touch");
+        }
+      }
+    }
+
+    lastTouch = isTouched;
+  }
+
+  // -----------------------------
   // Serial Commands for testing - VQA only
+  // -----------------------------
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -765,6 +875,8 @@ void loop() {
           );
           if (result == pdPASS) {
             logInfo("CMD", "VQA streaming started via serial");
+            digitalWrite(led_pin, HIGH);
+            ledState = true;
           } else {
             logError("CMD", "Failed to start VQA streaming task via serial");
           }
@@ -787,6 +899,9 @@ void loop() {
       logInfo("SYS", "=== System Status ===");
       logInfo("SYS", "BLE connected: " + String(deviceConnected ? "Yes" : "No"));
       logInfo("SYS", "System initialized: " + String(systemInitialized ? "Yes" : "No"));
+      logInfo("SYS", "VQA running: " + String(vqaState.isRunning ? "Yes" : "No"));
+      logInfo("SYS", "Temperature monitoring: " + String(tempMonitoringEnabled ? "Enabled" : "Disabled"));
+      logInfo("SYS", "Touch commands: " + String(touchEnabled ? "Enabled" : "Disabled"));
       logInfo("SYS", "Chunk size: " + String(negotiatedChunkSize) + " bytes");
       logMemory("SYS");
     }
@@ -795,14 +910,19 @@ void loop() {
       logInfo("SYS", "Debug logging " + String(currentLogLevel == LOG_DEBUG ? "enabled" : "disabled"));
     }
     else if (cmd == "TEMP") {
-      float temp = temperatureRead(); // returns °C
-      logInfo("SYS", "Internal Temperature: " + String(temp, 1) + " °C");
+      tempMonitoringEnabled = !tempMonitoringEnabled;
+      logInfo("CMD", "Temperature monitoring " + String(tempMonitoringEnabled ? "enabled" : "disabled") + " via serial (overheat protection always active)");
+    }
+    else if (cmd == "TOUCH") {
+      touchEnabled = !touchEnabled;
+      logInfo("CMD", "Touch commands " + String(touchEnabled ? "enabled" : "disabled") + " via serial");
     }
     else if (cmd.length() > 0) {
       logWarn("CMD", "Unknown serial command: '" + cmd + "'");
-      logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP");
+      logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP, TOUCH");
     }
   }
+
   delay(10);
 }
 
@@ -836,4 +956,3 @@ void printWelcomeArt() {
   
   logInfo("SYS", "Welcome, Cj");
 }
-
