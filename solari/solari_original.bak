@@ -11,9 +11,9 @@
 #define CAPTURE_DEBOUNCE_MS 500
 #define SEND_DELAY_BETWEEN_CHUNKS_MS 15
 
-// VQA streaming configuration
-#define VQA_STREAM_CHUNK_DURATION_MS 500  // 500ms chunks for VQA streaming
-#define VQA_STREAM_BUFFER_COUNT 4         // Number of buffers for smooth streaming
+// Audio streaming configuration
+#define AUDIO_STREAM_CHUNK_DURATION_MS 500  // 500ms chunks for streaming
+#define AUDIO_STREAM_BUFFER_COUNT 4         // Number of buffers for smooth streaming
 
 
 
@@ -27,7 +27,19 @@ BLECharacteristic* pCharacteristic;
 int negotiatedChunkSize = 23;
 I2SClass i2s;
 
-// Task handles for VQA only
+// Task handles for on-demand tasks
+TaskHandle_t imageTaskHandle = nullptr;
+
+// Audio streaming state
+struct AudioStreamState {
+  bool isStreaming = false;
+  bool stopRequested = false;
+  unsigned long streamStartTime = 0;
+  size_t totalStreamed = 0;
+  int chunkNumber = 0;
+  TaskHandle_t streamTaskHandle = nullptr;
+};
+AudioStreamState audioStream;
 
 // VQA state management
 struct VQAState {
@@ -200,7 +212,59 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
     } 
 
     // Commands
-    if (value == "VQA_START") {
+    else if (value == "IMAGE") {
+      if (systemInitialized) {
+        // Check if image task is already running
+        if (imageTaskHandle != nullptr) {
+          logWarn("CMD", "Image capture already in progress");
+        } else {
+          // Create image capture task on-demand
+          BaseType_t result = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
+          if (result == pdPASS) {
+            logInfo("CMD", "Image capture task created");
+          } else {
+            logError("CMD", "Failed to create image capture task");
+          }
+        }
+      } else {
+        logWarn("CMD", "Image capture ignored - system not initialized");
+      }
+    }
+    else if (value == "AUDIO_START") {
+      if (systemInitialized) {
+        if (!audioStream.isStreaming) {
+          // Start streaming audio
+          audioStream.stopRequested = false;
+          BaseType_t result = xTaskCreatePinnedToCore(
+            audioStreamTask, 
+            "AudioStreamTask", 
+            16384, 
+            nullptr, 
+            2, // Higher priority
+            &audioStream.streamTaskHandle, 
+            1  // Core 1
+          );
+          if (result == pdPASS) {
+            logInfo("CMD", "Audio streaming started");
+          } else {
+            logError("CMD", "Failed to start audio streaming task");
+          }
+        } else {
+          logWarn("CMD", "Audio streaming already active");
+        }
+      } else {
+        logWarn("CMD", "Audio streaming ignored - system not initialized");
+      }
+    }
+    else if (value == "AUDIO_STOP") {
+      if (audioStream.isStreaming) {
+        audioStream.stopRequested = true;
+        logInfo("CMD", "Audio streaming stop requested");
+      } else {
+        logWarn("CMD", "No audio streaming active to stop");
+      }
+    }
+    else if (value == "VQA_START") {
       if (systemInitialized) {
         if (!vqaState.isRunning) {
           // Start VQA streaming
@@ -268,6 +332,13 @@ void cleanupSystem() {
   Serial.println();
   logInfo("SYS", "========================== Cleaning up system components ==========================");
   
+  // Delete tasks
+  if (imageTaskHandle) {
+    vTaskDelete(imageTaskHandle);
+    imageTaskHandle = nullptr;
+    logInfo("SYS", "Image task deleted");
+  }
+  
   // Clean up VQA background task if running
   if (vqaState.vqaTaskHandle) {
     vqaState.stopRequested = true;
@@ -278,6 +349,18 @@ void cleanupSystem() {
     }
     vqaState.isRunning = false;
     logInfo("SYS", "VQA streaming task deleted");
+  }
+  
+  // Clean up continuous audio streaming task if running
+  if (audioStream.streamTaskHandle) {
+    audioStream.stopRequested = true;
+    vTaskDelay(pdMS_TO_TICKS(100)); // Give time for graceful stop
+    if (audioStream.streamTaskHandle) {
+      vTaskDelete(audioStream.streamTaskHandle);
+      audioStream.streamTaskHandle = nullptr;
+    }
+    audioStream.isStreaming = false;
+    logInfo("SYS", "Audio streaming task deleted");
   }
   
   // Reset VQA state
@@ -429,8 +512,234 @@ void initBLE() {
 
 
 // ============================================================================
-// FreeRTOS Tasks - VQA Only
+// FreeRTOS Tasks - On-Demand Creation
 // ============================================================================
+
+// Image Task - One-shot capture task (created on-demand)
+void imageTask(void *param) {
+  logInfo("TASK", "Image capture task started");
+
+  // BLE Connection Check
+  if (!deviceConnected) {
+    logWarn("IMG", "No BLE client connected - skipping capture");
+    imageTaskHandle = nullptr;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  logInfo("IMG", "Starting image capture...");
+  logMemory("IMG");
+
+  // Take picture
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  // Force fresh frame. It retries once to get a camera frame and skips if capture still fails.
+  if (!fb) {
+    logWarn("IMG", "First capture failed, retrying...");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      logError("IMG", "Camera capture failed after retry");
+      imageTaskHandle = nullptr;
+      vTaskDelete(NULL);
+      return;
+    }
+  }
+
+  // Takes the frame captured by the camera, extracts its size and data buffer, and then logs the size for debugging.
+  size_t totalSize = fb->len;
+  uint8_t *buffer = fb->buf;
+  logInfo("IMG", "Captured " + String(totalSize) + " bytes (" + 
+          String(totalSize/1024) + " KB)");
+
+  // ------------------------------------------------------------------------------------------
+  // Send Image Data
+  // ------------------------------------------------------------------------------------------
+  logInfo("IMG", "Starting BLE transmission...");
+  
+  // Header
+  String header = "IMG_START:" + String(totalSize);
+  pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
+  pCharacteristic->notify();
+  vTaskDelay(pdMS_TO_TICKS(20));
+  logDebug("IMG", "Header sent: " + header);
+
+  // Chunks
+  size_t sentBytes = 0;
+  size_t chunkCount = 0;
+  unsigned long transferStart = millis();
+  
+  for (size_t i = 0; i < totalSize; i += negotiatedChunkSize) {
+    int len = (i + negotiatedChunkSize > totalSize) ? (totalSize - i) : negotiatedChunkSize;
+    pCharacteristic->setValue(buffer + i, len);
+    pCharacteristic->notify();
+    sentBytes += len;
+    chunkCount++;
+    vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
+    
+    logProgressRate("IMG", sentBytes, totalSize, transferStart);
+  }
+
+  unsigned long transferTime = millis() - transferStart;
+  float transferRate = (totalSize / 1024.0) / (transferTime / 1000.0);
+  
+  // Footer
+  String footer = "IMG_END";
+  pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
+  pCharacteristic->notify();
+  logDebug("IMG", "Footer sent: " + footer);
+  // ------------------------------------------------------------------------------------------
+
+  logInfo("IMG", "Transfer complete in " + String(transferTime) + 
+          "ms (" + String(transferRate, 1) + " KB/s)");
+
+  // Release memory when done
+  esp_camera_fb_return(fb);
+  logMemory("IMG");
+
+  // Clean up task handle and delete task
+  imageTaskHandle = nullptr;
+  logInfo("IMG", "Image capture task completed");
+  vTaskDelete(NULL);
+}
+
+// Audio Streaming Task - Start/Stop Control
+void audioStreamTask(void *param) {
+  logInfo("AUDIO-STREAM", "Audio streaming task started");
+  
+  // Calculate streaming parameters  
+  const int sampleRate = 8000;
+  const int bytesPerSample = 2; // 16-bit
+  const int bytesPerSecond = sampleRate * bytesPerSample;
+  const int chunkDuration = AUDIO_STREAM_CHUNK_DURATION_MS;
+  const int chunkSizeBytes = (bytesPerSecond * chunkDuration) / 1000;
+  
+  logDebug("AUDIO-STREAM", "Stream config: " + String(chunkSizeBytes) + " bytes/chunk, " + 
+           String(chunkDuration) + "ms/chunk, no time limit");
+
+  // Initialize streaming state
+  audioStream.isStreaming = true;
+  audioStream.streamStartTime = millis();
+  audioStream.totalStreamed = 0;
+  audioStream.chunkNumber = 0;
+
+  // Send streaming header
+  String header = "AUD_STREAM_START:CONTINUOUS:" + String(chunkDuration);
+  pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
+  pCharacteristic->notify();
+  vTaskDelay(pdMS_TO_TICKS(20));
+  logDebug("AUDIO-STREAM", "Streaming header sent: " + header);
+
+  bool streamingSuccess = true;
+
+  // Continuous streaming loop - runs until stop requested
+  while (!audioStream.stopRequested && streamingSuccess && deviceConnected) {
+    audioStream.chunkNumber++;
+    
+    // Allocate buffer for this chunk
+    uint8_t* chunkBuffer = new uint8_t[chunkSizeBytes];
+    if (!chunkBuffer) {
+      logError("AUDIO-STREAM", "Failed to allocate chunk buffer");
+      streamingSuccess = false;
+      break;
+    }
+
+    // Record audio chunk
+    size_t bytesRead = 0;
+    unsigned long recordStart = millis();
+    
+    while (bytesRead < chunkSizeBytes && (millis() - recordStart) < (chunkDuration + 100)) {
+      size_t bytesToRead = min((size_t)negotiatedChunkSize, chunkSizeBytes - bytesRead);
+      size_t actuallyRead = i2s.readBytes((char*)(chunkBuffer + bytesRead), bytesToRead);
+      bytesRead += actuallyRead;
+      
+      if (actuallyRead == 0) {
+        vTaskDelay(pdMS_TO_TICKS(1)); // Small delay if no data available
+      }
+      
+      // Check for stop request during recording
+      if (audioStream.stopRequested) {
+        break;
+      }
+    }
+    
+    if (bytesRead < chunkSizeBytes && !audioStream.stopRequested) {
+      logWarn("AUDIO-STREAM", "Chunk " + String(audioStream.chunkNumber) + " incomplete: " + 
+              String(bytesRead) + "/" + String(chunkSizeBytes) + " bytes");
+    }
+
+    // Only send if we have data and not stopping
+    if (bytesRead > 0 && !audioStream.stopRequested) {
+      // Send chunk header
+      String chunkHeader = "AUD_CHUNK:" + String(audioStream.chunkNumber) + ":" + String(bytesRead);
+      pCharacteristic->setValue((uint8_t*)chunkHeader.c_str(), chunkHeader.length());
+      pCharacteristic->notify();
+      vTaskDelay(pdMS_TO_TICKS(5));
+
+      // Send chunk data in BLE-sized packets
+      for (size_t i = 0; i < bytesRead && !audioStream.stopRequested; i += negotiatedChunkSize) {
+        size_t packetSize = min((size_t)negotiatedChunkSize, bytesRead - i);
+        pCharacteristic->setValue(chunkBuffer + i, packetSize);
+        pCharacteristic->notify();
+        vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
+        
+        // Check if client disconnected during streaming
+        if (!deviceConnected) {
+          logWarn("AUDIO-STREAM", "Client disconnected during streaming");
+          streamingSuccess = false;
+          break;
+        }
+      }
+
+      audioStream.totalStreamed += bytesRead;
+      logStreamingProgress("AUDIO-STREAM", bytesRead, audioStream.totalStreamed, audioStream.streamStartTime, audioStream.chunkNumber);
+    }
+
+    // Clean up chunk buffer
+    delete[] chunkBuffer;
+
+    if (!streamingSuccess) break;
+  }
+
+  // Determine stop reason
+  String stopReason;
+  if (audioStream.stopRequested) {
+    stopReason = "User requested stop";
+  } else if (!deviceConnected) {
+    stopReason = "Client disconnected";
+  } else {
+    stopReason = "Stream error";
+  }
+
+  // Send completion footer
+  if (streamingSuccess || audioStream.stopRequested) {
+    String footer = "AUD_STREAM_END";
+    pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
+    pCharacteristic->notify();
+    logDebug("AUDIO-STREAM", "Streaming footer sent: " + footer);
+
+    unsigned long totalTime = millis() - audioStream.streamStartTime;
+    float avgRate = (audioStream.totalStreamed / 1024.0) / (totalTime / 1000.0);
+    
+    logInfo("AUDIO-STREAM", "Streaming stopped: " + stopReason);
+    logInfo("AUDIO-STREAM", "Total: " + String(audioStream.totalStreamed) + " bytes (" + 
+            String(audioStream.totalStreamed/1024.0, 1) + " KB) in " + String(totalTime) + 
+            "ms (" + String(avgRate, 1) + " KB/s avg)");
+  } else {
+    String errorFooter = "AUD_STREAM_ERROR";
+    pCharacteristic->setValue((uint8_t*)errorFooter.c_str(), errorFooter.length());
+    pCharacteristic->notify();
+    logError("AUDIO-STREAM", "Streaming failed: " + stopReason);
+  }
+
+  // Reset streaming state
+  audioStream.isStreaming = false;
+  audioStream.stopRequested = false;
+  audioStream.streamTaskHandle = nullptr;
+  
+  // Task auto-cleanup
+  vTaskDelete(NULL);
+}
 
 // VQA Streaming Task - Audio First, Then Image After Stop
 void vqaStreamTask(void *param) {
@@ -449,18 +758,18 @@ void vqaStreamTask(void *param) {
   const int sampleRate = 8000;
   const int bytesPerSample = 2; // 16-bit
   const int bytesPerSecond = sampleRate * bytesPerSample;
-  const int chunkDuration = VQA_STREAM_CHUNK_DURATION_MS;
+  const int chunkDuration = AUDIO_STREAM_CHUNK_DURATION_MS;
   const int chunkSizeBytes = (bytesPerSecond * chunkDuration) / 1000;
   
   logDebug("VQA-STREAM", "Stream config: " + String(chunkSizeBytes) + " bytes/chunk, " + 
            String(chunkDuration) + "ms/chunk, image after audio stops");
 
-  // Send VQA start header
-  String header = "VQA_START";
+  // Send VQA streaming header
+  String header = "VQA_STREAM_START:CONTINUOUS:" + String(chunkDuration);
   pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
   pCharacteristic->notify();
   vTaskDelay(pdMS_TO_TICKS(20));
-  logDebug("VQA-STREAM", "Start header sent");
+  logDebug("VQA-STREAM", "VQA streaming header sent: " + header);
 
   // Initialize streaming state
   vqaState.audioStreamingActive = true;
@@ -510,7 +819,13 @@ void vqaStreamTask(void *param) {
 
     // Only send if we have data and not stopping
     if (bytesRead > 0 && !vqaState.stopRequested) {
-      // Send chunk data directly in BLE-sized packets (no header needed)
+      // Send chunk header
+      String chunkHeader = "VQA_AUD_CHUNK:" + String(chunkNumber) + ":" + String(bytesRead);
+      pCharacteristic->setValue((uint8_t*)chunkHeader.c_str(), chunkHeader.length());
+      pCharacteristic->notify();
+      vTaskDelay(pdMS_TO_TICKS(5));
+
+      // Send chunk data in BLE-sized packets
       for (size_t i = 0; i < bytesRead && !vqaState.stopRequested; i += negotiatedChunkSize) {
         size_t packetSize = min((size_t)negotiatedChunkSize, bytesRead - i);
         pCharacteristic->setValue(chunkBuffer + i, packetSize);
@@ -539,12 +854,12 @@ void vqaStreamTask(void *param) {
   vqaState.audioStreamingActive = false;
   vqaState.audioRecordingComplete = true;
 
-  // Send audio end signal
-  String audioEndHeader = "A_END";
+  // Send audio streaming end signal
+  String audioEndHeader = "VQA_AUD_STREAM_END";
   pCharacteristic->setValue((uint8_t*)audioEndHeader.c_str(), audioEndHeader.length());
   pCharacteristic->notify();
   vTaskDelay(pdMS_TO_TICKS(20));
-  logDebug("VQA-STREAM", "Audio end sent");
+  logDebug("VQA-STREAM", "Audio streaming end header sent: " + audioEndHeader);
 
   unsigned long audioTime = millis() - vqaState.streamStartTime;
   float avgRate = (vqaState.totalAudioStreamed / 1024.0) / (audioTime / 1000.0);
@@ -583,11 +898,11 @@ void vqaStreamTask(void *param) {
       logInfo("VQA-STREAM", "Starting image transmission...");
       
       // Image header
-      String imageHeader = "I:" + String(imageSize);
+      String imageHeader = "VQA_IMG_START:" + String(imageSize);
       pCharacteristic->setValue((uint8_t*)imageHeader.c_str(), imageHeader.length());
       pCharacteristic->notify();
       vTaskDelay(pdMS_TO_TICKS(20));
-      logDebug("VQA-STREAM", "Image header sent");
+      logDebug("VQA-STREAM", "Image header sent: " + imageHeader);
 
       // Send image chunks
       size_t sentBytes = 0;
@@ -615,11 +930,11 @@ void vqaStreamTask(void *param) {
         float imageTransferRate = (imageSize / 1024.0) / (imageTransferTime / 1000.0);
         
         // Image footer
-        String imageFooter = "I_END";
+        String imageFooter = "VQA_IMG_END";
         pCharacteristic->setValue((uint8_t*)imageFooter.c_str(), imageFooter.length());
         pCharacteristic->notify();
         vTaskDelay(pdMS_TO_TICKS(20));
-        logDebug("VQA-STREAM", "Image footer sent");
+        logDebug("VQA-STREAM", "Image footer sent: " + imageFooter);
 
         logInfo("VQA-STREAM", "Image transfer complete in " + String(imageTransferTime) + 
                 "ms (" + String(imageTransferRate, 1) + " KB/s)");
@@ -648,10 +963,10 @@ void vqaStreamTask(void *param) {
 
   // Send completion footer
   if (streamingSuccess || vqaState.stopRequested) {
-    String footer = "VQA_END";
+    String footer = "VQA_STREAM_END";
     pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
     pCharacteristic->notify();
-    logDebug("VQA-STREAM", "VQA footer sent");
+    logDebug("VQA-STREAM", "VQA streaming footer sent: " + footer);
 
     unsigned long totalTime = millis() - vqaState.streamStartTime;
     
@@ -660,7 +975,7 @@ void vqaStreamTask(void *param) {
     logInfo("VQA-STREAM", "Audio streamed: " + String(vqaState.totalAudioStreamed/1024.0, 1) + " KB");
     logInfo("VQA-STREAM", "Image captured: " + String(vqaState.imageTransmissionComplete ? "Yes" : "No"));
   } else {
-    String errorFooter = "VQA_ERR";
+    String errorFooter = "VQA_STREAM_ERROR";
     pCharacteristic->setValue((uint8_t*)errorFooter.c_str(), errorFooter.length());
     pCharacteristic->notify();
     logError("VQA-STREAM", "VQA streaming failed: " + stopReason);
@@ -720,15 +1035,78 @@ void loop() {
 
 
 
+  // Monitor Temperature
+  // float temp = temperatureRead(); // returns °C
+  // Serial.print("Internal Temperature: ");
+  // Serial.print(temp);
+  // Serial.println(" °C");
+
+  // delay(1000); // Update every 1 second
 
   // !! TEMPORARY !!
-  // Serial Commands for testing - VQA only
+  // Serial Commands for testing
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     cmd.toUpperCase();
 
-    if (cmd == "VQA_START") {
+    if (cmd == "IMAGE") {
+      if (!deviceConnected) {
+        logWarn("CMD", "Image capture ignored - BLE not connected");
+      } else if (systemInitialized) {
+        // Check if image task is already running
+        if (imageTaskHandle != nullptr) {
+          logWarn("CMD", "Image capture already in progress");
+        } else {
+          // Create image capture task on-demand
+          BaseType_t result = xTaskCreatePinnedToCore(imageTask, "ImageTask", 16384, nullptr, 1, &imageTaskHandle, 1);
+          if (result == pdPASS) {
+            logInfo("CMD", "Image capture task created via serial");
+          } else {
+            logError("CMD", "Failed to create image capture task via serial");
+          }
+        }
+      } else {
+        logWarn("CMD", "Image capture ignored - system not initialized");
+      }
+    } 
+    else if (cmd == "AUDIO_START") {
+      if (!deviceConnected) {
+        logWarn("CMD", "Audio streaming ignored - BLE not connected");
+      } else if (systemInitialized) {
+        if (!audioStream.isStreaming) {
+          // Start streaming audio
+          audioStream.stopRequested = false;
+          BaseType_t result = xTaskCreatePinnedToCore(
+            audioStreamTask, 
+            "AudioStreamTask", 
+            16384, 
+            nullptr, 
+            2, // Higher priority
+            &audioStream.streamTaskHandle, 
+            1  // Core 1
+          );
+          if (result == pdPASS) {
+            logInfo("CMD", "Audio streaming started via serial");
+          } else {
+            logError("CMD", "Failed to start audio streaming task via serial");
+          }
+        } else {
+          logWarn("CMD", "Audio streaming already active");
+        }
+      } else {
+        logWarn("CMD", "Audio streaming ignored - system not initialized");
+      }
+    }
+    else if (cmd == "AUDIO_STOP") {
+      if (audioStream.isStreaming) {
+        audioStream.stopRequested = true;
+        logInfo("CMD", "Audio streaming stop requested via serial");
+      } else {
+        logWarn("CMD", "No audio streaming active to stop");
+      }
+    } 
+    else if (cmd == "VQA_START") {
       if (!deviceConnected) {
         logWarn("CMD", "VQA streaming ignored - BLE not connected");
       } else if (systemInitialized) {
@@ -775,13 +1153,9 @@ void loop() {
       currentLogLevel = (currentLogLevel == LOG_DEBUG) ? LOG_INFO : LOG_DEBUG;
       logInfo("SYS", "Debug logging " + String(currentLogLevel == LOG_DEBUG ? "enabled" : "disabled"));
     }
-    else if (cmd == "TEMP") {
-      float temp = temperatureRead(); // returns °C
-      logInfo("SYS", "Internal Temperature: " + String(temp, 1) + " °C");
-    }
     else if (cmd.length() > 0) {
       logWarn("CMD", "Unknown serial command: '" + cmd + "'");
-      logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP");
+      logInfo("CMD", "Available commands: IMAGE, AUDIO_START, AUDIO_STOP, VQA_START, VQA_STOP, STATUS, DEBUG");
     }
   }
   delay(10);
