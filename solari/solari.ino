@@ -556,7 +556,7 @@ void vqaStreamTask(void *param) {
   // ============================================================================
   // STEP 2: Capture and Send Image (only after audio streaming stops)
   // ============================================================================
-  if (streamingSuccess && deviceConnected) {
+  if (streamingSuccess && deviceConnected && !vqaState.stopRequested) {
     logInfo("VQA-STREAM", "Starting image capture after audio streaming stopped...");
     
     // Take picture
@@ -630,6 +630,25 @@ void vqaStreamTask(void *param) {
       // Release camera frame buffer
       esp_camera_fb_return(fb);
     }
+  } else if (vqaState.stopRequested && deviceConnected) {
+    // VQA was stopped - send minimal image protocol for consistency
+    logInfo("VQA-STREAM", "VQA stopped - sending empty image protocol");
+    
+    // Send empty image header (0 size)
+    String imageHeader = "I:0";
+    pCharacteristic->setValue((uint8_t*)imageHeader.c_str(), imageHeader.length());
+    pCharacteristic->notify();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    logDebug("VQA-STREAM", "Empty image header sent");
+
+    // Send immediate image footer (no data)
+    String imageFooter = "I_END";
+    pCharacteristic->setValue((uint8_t*)imageFooter.c_str(), imageFooter.length());
+    pCharacteristic->notify();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    logDebug("VQA-STREAM", "Empty image footer sent");
+    
+    logInfo("VQA-STREAM", "Empty image protocol complete (VQA stopped)");
   }
 
   // ============================================================================
