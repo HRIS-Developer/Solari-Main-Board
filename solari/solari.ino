@@ -58,7 +58,7 @@ enum LogLevel {
 };
 
 // Current log level (change to LOG_DEBUG for more verbose output)
-LogLevel currentLogLevel = LOG_INFO;
+LogLevel currentLogLevel = LOG_DEBUG;
 
 // Log level strings
 const char* logLevelStr[] = {"DEBUG", "INFO", "WARN", "ERROR"};
@@ -99,32 +99,8 @@ void logMemory(const String &component) {
   }
 }
 
-// Progress logger for data transfers with visual progress bar
-void logProgress(const String &component, size_t current, size_t total) {
-  if (currentLogLevel <= LOG_INFO) {
-    int percent = (current * 100) / total;
-    
-    // Create progress bar
-    const int barWidth = 20;
-    int filled = (percent * barWidth) / 100;
-    String progressBar = "[";
-    
-    for (int i = 0; i < barWidth; i++) {
-      if (i < filled) {
-        progressBar += "█";
-      } else {
-        progressBar += "░";
-      }
-    }
-    progressBar += "]";
-    
-    log(LOG_INFO, component, progressBar + " (" + String(percent) + "%) " + 
-        String(current) + "/" + String(total) + " bytes");
-  }
-}
-
 // Enhanced progress logger with transfer rate
-void logProgressWithRate(const String &component, size_t current, size_t total, unsigned long startTime) {
+void logProgressRate(const String &component, size_t current, size_t total, unsigned long startTime) {
   if (currentLogLevel <= LOG_INFO) {
     int percent = (current * 100) / total;
     unsigned long elapsed = millis() - startTime;
@@ -184,7 +160,7 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
     if (value.startsWith("MTU:")) {
       int mtu = value.substring(4).toInt();
       if (mtu >= 23 && mtu <= 512) {
-        negotiatedChunkSize = max(20, mtu - 6);
+        negotiatedChunkSize = max(20, mtu);
         logInfo("BLE", "MTU negotiated: " + String(mtu) + 
                " bytes, chunk size: " + String(negotiatedChunkSize) + " bytes");
       } else {
@@ -263,8 +239,8 @@ void initCamera() {
   // FRAMESIZE_SVGA - 800x600 
   // FRAMESIZE_XGA - 1024x768 
   // FRAMESIZE_HD - 1280x720 
-  // FRAMESIZE_UXGA - 1600x1200 
-  config.frame_size = FRAMESIZE_HD; 
+  // FRAMESIZE_UXGA - 1600x1200
+  config.frame_size = FRAMESIZE_XGA; 
   // ------------------------------------------
 
   config.pixel_format = PIXFORMAT_JPEG;
@@ -419,10 +395,7 @@ void imageTask(void *param) {
         chunkCount++;
         vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
         
-        // Log progress every 10 chunks or at the end with visual progress bar
-        if (chunkCount % 10 == 0 || sentBytes >= totalSize) {
-          logProgressWithRate("IMG", sentBytes, totalSize, transferStart);
-        }
+        logProgressRate("IMG", sentBytes, totalSize, transferStart);
       }
 
       unsigned long transferTime = millis() - transferStart;
@@ -465,98 +438,95 @@ void audioTask(void *param) {
   logInfo("TASK", "Audio task started");
 
   for (;;) {
-      // Wait for audio capture request
-      if (xQueueReceive(audioQueue, &req, portMAX_DELAY) == pdTRUE) {
+    // Wait for audio capture request
+    if (xQueueReceive(audioQueue, &req, portMAX_DELAY) == pdTRUE) {
 
-        // Debounce too fast command requests, avoid spamming
-        unsigned long now = millis();
-        if (now - lastCaptureMs < CAPTURE_DEBOUNCE_MS) {
-            logWarn("AUD", "Request debounced (too frequent)");
-            continue;
-        }
-        lastCaptureMs = now;
+      // Debounce too fast command requests, avoid spamming
+      unsigned long now = millis();
+      if (now - lastCaptureMs < CAPTURE_DEBOUNCE_MS) {
+          logWarn("AUD", "Request debounced (too frequent)");
+          continue;
+      }
+      lastCaptureMs = now;
 
-        // BLE Connection Check
-        if (!deviceConnected) {
-            logWarn("AUD", "No BLE client connected - skipping recording");
-            continue;
-        }
+      // BLE Connection Check
+      if (!deviceConnected) {
+          logWarn("AUD", "No BLE client connected - skipping recording");
+          continue;
+      }
 
-        logInfo("AUD", "Starting 5-second audio recording...");
-        logMemory("AUD");
+      logInfo("AUD", "Starting 5-second audio recording...");
+      logMemory("AUD");
 
-        // Record audio for 5 seconds
-        unsigned long recordStart = millis();
-        size_t wav_size = 0;
-        uint8_t* wav_buffer = i2s.recordWAV(5, &wav_size);
-        unsigned long recordTime = millis() - recordStart;
-        
-        if (!wav_buffer) {
-            logError("AUD", "Audio recording failed");
-            continue;
-        }
-        
-        logInfo("AUD", "Recorded " + String(wav_size) + " bytes (" + 
-                String(wav_size/1024) + " KB) in " + String(recordTime) + "ms");
+      // Record audio for 5 seconds
+      unsigned long recordStart = millis();
+      size_t wav_size = 0;
+      uint8_t* wav_buffer = i2s.recordWAV(5, &wav_size);
+      unsigned long recordTime = millis() - recordStart;
+      
+      if (!wav_buffer) {
+          logError("AUD", "Audio recording failed");
+          continue;
+      }
+      
+      logInfo("AUD", "Recorded " + String(wav_size) + " bytes (" + 
+              String(wav_size/1024) + " KB) in " + String(recordTime) + "ms");
 
-        // ------------------------------------------------------------------------------------------
-        // Send Audio Data
-        // ------------------------------------------------------------------------------------------
-        logInfo("AUD", "Starting BLE transmission...");
-        
-        // Header
-        String header = "AUD_START:" + String(wav_size);
-        pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
-        pCharacteristic->notify();
-        vTaskDelay(pdMS_TO_TICKS(20));
-        logDebug("AUD", "Header sent: " + header);
+      // ------------------------------------------------------------------------------------------
+      // Send Audio Data
+      // ------------------------------------------------------------------------------------------
+      logInfo("AUD", "Starting BLE transmission...");
+      
+      // Header
+      String header = "AUD_START:" + String(wav_size);
+      pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
+      pCharacteristic->notify();
+      vTaskDelay(pdMS_TO_TICKS(20));
+      logDebug("AUD", "Header sent: " + header);
 
-        // Chunks
-        size_t sentBytes = 0;
-        size_t chunkCount = 0;
-        unsigned long transferStart = millis();
-        
+      // Chunks
+      size_t sentBytes = 0;
+      size_t chunkCount = 0;
+      unsigned long transferStart = millis();
+      
         for (size_t i = 0; i < wav_size; i += negotiatedChunkSize) {
             int len = (i + negotiatedChunkSize > wav_size) ? (wav_size - i) : negotiatedChunkSize;
-            pCharacteristic->setValue(wav_buffer + i, len);
-            pCharacteristic->notify();
-            sentBytes += len;
-            chunkCount++;
-            vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
-            
-            // Log progress every 10 chunks or at the end with visual progress bar
-            if (chunkCount % 10 == 0 || sentBytes >= wav_size) {
-              logProgressWithRate("AUD", sentBytes, wav_size, transferStart);
-            }
-        }
-
-        unsigned long transferTime = millis() - transferStart;
-        float transferRate = (wav_size / 1024.0) / (transferTime / 1000.0);
-
-        // Footer
-        String footer = "AUD_END";
-        pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
+        pCharacteristic->setValue(wav_buffer + i, len);
         pCharacteristic->notify();
-        logDebug("AUD", "Footer sent: " + footer);
-        // ------------------------------------------------------------------------------------------
-
-        logInfo("AUD", "Transfer complete in " + String(transferTime) + 
-                "ms (" + String(transferRate, 1) + " KB/s)");
-
-        // Free recorded audio memory
-        delete[] wav_buffer;
-        logMemory("AUD");
-
-        // Drain extra queued requests
-        uint8_t drain;
-        int drained = 0;
-        while (xQueueReceive(audioQueue, &drain, 0) == pdTRUE) {
-          drained++;
-        }
-        if (drained > 0) {
-          logDebug("AUD", "Drained " + String(drained) + " queued requests");
-        }
+        sentBytes += len;
+        chunkCount++;
+        vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
+        
+        logProgressRate("AUD", sentBytes, wav_size, transferStart);
       }
+
+      unsigned long transferTime = millis() - transferStart;
+      float transferRate = (wav_size / 1024.0) / (transferTime / 1000.0);
+
+      // Footer
+      String footer = "AUD_END";
+      pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
+      pCharacteristic->notify();
+      logDebug("AUD", "Footer sent: " + footer);
+      // ------------------------------------------------------------------------------------------
+
+      logInfo("AUD", "Transfer complete in " + String(transferTime) + 
+              "ms (" + String(transferRate, 1) + " KB/s)");
+
+      // Free recorded audio memory
+      delete[] wav_buffer;
+      logMemory("AUD");
+
+      // Drain extra queued requests
+      uint8_t drain;
+      int drained = 0;
+      while (xQueueReceive(audioQueue, &drain, 0) == pdTRUE) {
+        drained++;
+      }
+      if (drained > 0) {
+        logDebug("AUD", "Drained " + String(drained) + " queued requests");
+      }
+    }
   }
   // Task cleanly stop itself when it no longer needs to run, freeing resources
   vTaskDelete(NULL);
@@ -697,11 +667,8 @@ void vqaTask(void *param) {
         sentBytes += len;
         chunkCount++;
         vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
-        
-        // Log progress every 10 chunks or at the end with visual progress bar
-        if (chunkCount % 10 == 0 || sentBytes >= imageSize) {
-          logProgressWithRate("VQA-IMG", sentBytes, imageSize, transferStart);
-        }
+          
+        logProgressRate("VQA-IMG", sentBytes, imageSize, transferStart);
       }
 
       unsigned long imageTransferTime = millis() - transferStart;
@@ -752,11 +719,8 @@ void vqaTask(void *param) {
           sentBytes += len;
           chunkCount++;
           vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
-          
-          // Log progress every 10 chunks or at the end with visual progress bar
-          if (chunkCount % 10 == 0 || sentBytes >= vqaState.audioSize) {
-            logProgressWithRate("VQA-AUD", sentBytes, vqaState.audioSize, transferStart);
-          }
+
+          logProgressRate("VQA-AUD", sentBytes, vqaState.audioSize, transferStart);
         }
 
         unsigned long audioTransferTime = millis() - transferStart;
@@ -812,25 +776,19 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⠿⠿⣷⣦⣀⠀⢀⣀⣀⣤⣤⣤⣤⣤⣄⣀⡀⢀⣤⣶⠿⠿⣷⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⡟⢸⠀⠀⠉⠻⠿⠛⠛⠋⠉⠉⠉⠉⠉⠙⠛⠻⠿⠋⠁⠀⠀⢻⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⡇⠘⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⢸⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⡿⠛⠀⠀⠐⢠⣦⣦⣦⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣄⠀⠀⠙⣿⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⡟⠀⠀⠀⠀⠀⠸⣿⣿⣿⣿⣿⣿⣿⣿⠀⠸⣿⣿⣿⣿⣿⣿⣿⡇⡄⠀⠀⠈⢿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠇⠀⠀⠀⠀⠀⠀⢻⣿⣿⣿⣿⣿⡿⠁⣼⣄⠙⠿⣿⣿⣿⡿⠟⠀⠀⠀⠀⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡆⠀⠀⠀⠀⠀⣴⡿⠛⢿⡏⠉⠈⠰⡿⠛⠻⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⡀⢀⠀⠀⣸⣿⠁⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢙⣿⣶⡄⡾⠟⠃⠀⠀⣾⡏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⠿⣯⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⠃⠀⠀⠀⠀⠀⠀⣴⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠘⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀");
-    Serial.println("⢀⡀⡀⣀⣀⣀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀⠀⠊⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠀⠀⠀⣤⣾⠿⠛⠃⠀⠀⠀⣸⣷⠀⠀⠀⠀⣀⣀⡀⡀⠀");
-    Serial.println("⠺⠿⠛⠛⠛⠛⠿⠿⠿⠿⠿⠿⠿⠿⠿⠷⣶⢶⡶⡶⠶⠿⠿⠿⠿⠟⠛⠛⠻⠿⠿⠿⢿⣿⣀⣠⣤⣤⣤⣤⣶⠿⠛⠛⠛⠛⠛⠛⠛⠛⠻⠃");
-    Serial.println("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠉⠉⠉⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
+    // Welcome
+    printWelcomeArt();
     logInfo("SYS", "Compile time: " + String(__DATE__) + " " + String(__TIME__));
     logMemory("SYS");
 
     // Initialize BLE
     initBLE();
+
+    // Wait for BLE connection before continuing
+    logInfo("SYS", "Waiting for BLE connection...");
+    while (!deviceConnected) {
+        delay(100);
+    }
 
     // Initialize Camera
     initCamera();
@@ -895,6 +853,20 @@ void setup() {
 void loop() {
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   // Monitor Temperature
   // float temp = temperatureRead(); // returns °C
   // Serial.print("Internal Temperature: ");
@@ -954,3 +926,35 @@ void loop() {
   }
   delay(10);
 }
+
+
+
+// ============================================================================
+// Welcome Art
+// ============================================================================
+void printWelcomeArt() {
+  static const char* art[] = {
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⠿⠿⣷⣦⣀⠀⢀⣀⣀⣤⣤⣤⣤⣤⣄⣀⡀⢀⣤⣶⠿⠿⣷⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⡟⢸⠀⠀⠉⠻⠿⠛⠛⠋⠉⠉⠉⠉⠉⠙⠛⠻⠿⠋⠁⠀⠀⢻⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⡇⠘⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⢸⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⡿⠛⠀⠀⠐⢠⣦⣦⣦⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣄⠀⠀⠙⣿⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⡟⠀⠀⠀⠀⠀⠸⣿⣿⣿⣿⣿⣿⣿⣿⠀⠸⣿⣿⣿⣿⣿⣿⣿⡇⡄⠀⠀⠈⢿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠇⠀⠀⠀⠀⠀⠀⢻⣿⣿⣿⣿⣿⡿⠁⣼⣄⠙⠿⣿⣿⣿⡿⠟⠀⠀⠀⠀⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡆⠀⠀⠀⠀⠀⣴⡿⠛⢿⡏⠉⠈⠰⡿⠛⠻⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⡀⢀⠀⠀⣸⣿⠁⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢙⣿⣶⡄⡾⠟⠃⠀⠀⣾⡏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⠿⣯⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⠃⠀⠀⠀⠀⠀⠀⣴⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠘⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⢀⡀⡀⣀⣀⣀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀⠀⠊⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠀⠀⠀⣤⣾⠿⠛⠃⠀⠀⠀⣸⣷⠀⠀⠀⠀⣀⣀⡀⡀⠀",
+    "⠺⠿⠛⠛⠛⠛⠿⠿⠿⠿⠿⠿⠿⠿⠿⠷⣶⢶⡶⡶⠶⠿⠿⠿⠿⠟⠛⠛⠻⠿⠿⠿⢿⣿⣀⣠⣤⣤⣤⣤⣶⠿⠛⠛⠛⠛⠛⠛⠛⠛⠻⠃",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠉⠉⠉⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
+  };
+
+  for (const char* line : art) {
+    Serial.println(line);
+    delay(200);  // shorter, faster but still gives dramatic effect
+  }
+  
+  logInfo("SYS", "Welcome, Cj");
+}
+
