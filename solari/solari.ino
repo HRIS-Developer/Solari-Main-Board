@@ -4,30 +4,32 @@
 #include "esp_camera.h"
 #include "ESP_I2S.h"
 #include "esp_adc_cal.h"
+#include <BLE2902.h>
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define AUDIO_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define IMAGE_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26aa"
+#define TEMP_CHARACTERISTIC_UUID "00002A6E-0000-1000-8000-00805F9B34FB"
 
 #define CAPTURE_DEBOUNCE_MS 500
 #define SEND_DELAY_BETWEEN_CHUNKS_MS 15
 
-#define VQA_STREAM_CHUNK_DURATION_MS 100  // 500ms chunks for VQA streaming
+#define VQA_STREAM_CHUNK_DURATION_MS 150  // 500ms chunks for VQA streaming
 #define VQA_STREAM_BUFFER_COUNT 4         // Number of buffers for smooth streaming
 
+#define BUTTON_PIN D10
+
 
 
 // ============================================================================
-// Touch Globals
+// Button Globals
 // ============================================================================
-const int touch_pin = A5;        // Touch sensor pin
 const int led_pin = LED_BUILTIN; // On-board LED
 
 bool ledState = false;     // indicator LED state (mirrors vqa running)
-bool lastTouch = false;    // Previous touch state
-int threshold = 2000;      // Adjust based on your sensor values
-unsigned long lastTouchMillis = 0;
-const unsigned long TOUCH_DEBOUNCE_MS = 200; // extra safety debounce
-bool touchEnabled = true;  // Enable/disable touch commands
+bool lastButtonState = HIGH;    // Previous button state (HIGH = released, LOW = pressed)
+unsigned long lastButtonChange = 0;
+const unsigned long BUTTON_DEBOUNCE_MS = 50; // debounce delay
 
 
 
@@ -36,7 +38,7 @@ bool touchEnabled = true;  // Enable/disable touch commands
 // ============================================================================
 float tempThreshold = 55.0; // °C limit before shutdown
 TaskHandle_t tempTaskHandle;
-bool tempMonitoringEnabled = true; // Enable/disable temperature monitoring
+bool tempMonitoringEnabled = false; // Enable/disable temperature monitoring
 
 
 
@@ -45,7 +47,9 @@ bool tempMonitoringEnabled = true; // Enable/disable temperature monitoring
 // ============================================================================
 bool deviceConnected = false;
 bool systemInitialized = false;
-BLECharacteristic* pCharacteristic;
+BLECharacteristic* pAudioCharacteristic;
+BLECharacteristic* pImageCharacteristic;
+BLECharacteristic* pTempCharacteristic;
 int negotiatedChunkSize = 23;
 I2SClass i2s;
 
@@ -200,75 +204,11 @@ class MyServerCallbacks : public BLEServerCallbacks {
     BLEDevice::startAdvertising();
     logInfo("BLE", "Advertising restarted");
   }
-};
-
-class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
-    String value = String(characteristic->getValue().c_str());
-    value.trim();
-    value.toUpperCase();
-
-    // Raw Inputs
-    logDebug("BLE", "Raw received: '" + value + "'");
-
-    // MTU Change
-    if (value.startsWith("MTU:")) {
-      int mtu = value.substring(4).toInt();
-      if (mtu >= 23 && mtu <= 517) {
-        negotiatedChunkSize = max(20, mtu - 3);
-        logInfo("BLE", "MTU negotiated: " + String(mtu) + 
-               " bytes, chunk size: " + String(negotiatedChunkSize) + " bytes");
-      } else {
-        logWarn("BLE", "Invalid MTU value: " + String(mtu));
-      }
-    } 
-
-    // Commands
-    if (value == "VQA_START") {
-      if (systemInitialized) {
-        if (!vqaState.isRunning) {
-          // Start VQA streaming
-          vqaState.stopRequested = false;
-          BaseType_t result = xTaskCreatePinnedToCore(
-            vqaStreamTask, 
-            "VQAStreamTask", 
-            20480, 
-            nullptr, 
-            1, // Normal priority
-            &vqaState.vqaTaskHandle, 
-            1  // Core 1
-          );
-          if (result == pdPASS) {
-            logInfo("CMD", "VQA streaming started");
-          } else {
-            logError("CMD", "Failed to start VQA streaming task");
-          }
-        } else {
-          logWarn("CMD", "VQA streaming already active");
-        }
-      } else {
-        logWarn("CMD", "VQA streaming ignored - system not initialized");
-      }
-    }
-    else if (value == "VQA_STOP") {
-      if (vqaState.isRunning) {
-        vqaState.stopRequested = true;
-        logInfo("CMD", "VQA streaming stop requested");
-      } else {
-        logWarn("CMD", "No VQA streaming active to stop");
-      }
-    }
-    else if (value == "TEMP") {
-      tempMonitoringEnabled = !tempMonitoringEnabled;
-      logInfo("CMD", "Temperature monitoring " + String(tempMonitoringEnabled ? "enabled" : "disabled") + " (overheat protection always active)");
-    }
-    else if (value == "TOUCH") {
-      touchEnabled = !touchEnabled;
-      logInfo("CMD", "Touch commands " + String(touchEnabled ? "enabled" : "disabled"));
-    }
-    else {
-      logWarn("CMD", "Unknown command received: '" + value + "'");
-    }
+  void onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
+    int mtu = param->mtu.mtu;
+    negotiatedChunkSize = max(20, mtu - 3); // 3 bytes for ATT header
+    logInfo("BLE", "MTU changed: " + String(mtu) + " bytes, "
+                   "chunk size set to: " + String(negotiatedChunkSize) + " bytes");
   }
 };
 
@@ -294,6 +234,8 @@ void initializeSystem() {
   Serial.println();
   logMemory("SYS");
 }
+
+
 
 // Cleanup and free all resources
 void cleanupSystem() {
@@ -377,13 +319,14 @@ void initCamera() {
   // FRAMESIZE_XGA - 1024x768 
   // FRAMESIZE_HD - 1280x720 
   // FRAMESIZE_UXGA - 1600x1200
-  config.frame_size = FRAMESIZE_XGA; 
+  // FRAMESIZE_QSXGA - 2592x1944
+  config.frame_size = FRAMESIZE_HD; 
   // ------------------------------------------
 
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = psramFound() ? 10 : 12;
+  config.jpeg_quality = psramFound() ? 4 : 8;
   config.fb_count = psramFound() ? 2 : 1;
 
   logDebug("CAM", "PSRAM found: " + String(psramFound() ? "Yes" : "No"));
@@ -433,16 +376,33 @@ void initBLE() {
     logInfo("BLE", "Initializing Bluetooth LE...");
     
     BLEDevice::init("XIAO_ESP32S3");
-    BLEDevice::setMTU(517);
+    BLEDevice::setMTU(223);
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
     BLEService *pService = pServer->createService(SERVICE_UUID);
-    pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+
+    // Audio Characteristic (for streaming audio data)
+    pAudioCharacteristic = pService->createCharacteristic(
+        AUDIO_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
     );
-    pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+    pAudioCharacteristic->addDescriptor(new BLE2902());
+
+    // Image Characteristic (for sending image data)
+    pImageCharacteristic = pService->createCharacteristic(
+        IMAGE_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pImageCharacteristic->addDescriptor(new BLE2902());
+
+    // Temperature Characteristic
+    pTempCharacteristic = pService->createCharacteristic(
+        TEMP_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pTempCharacteristic->addDescriptor(new BLE2902());
+
     pService->start();
 
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -452,6 +412,8 @@ void initBLE() {
 
     logInfo("BLE", "Ready and advertising as 'XIAO_ESP32S3'");
     logDebug("BLE", "Service UUID: " + String(SERVICE_UUID));
+    logDebug("BLE", "Audio UUID: " + String(AUDIO_CHARACTERISTIC_UUID));
+    logDebug("BLE", "Image UUID: " + String(IMAGE_CHARACTERISTIC_UUID));
     logMemory("BLE");
 
     logInfo("SYS", "========================== BLE initialization complete - waiting for connections ==========================");
@@ -464,9 +426,9 @@ void initBLE() {
 // FreeRTOS Tasks
 // ============================================================================
 
-// VQA Streaming Task - Audio First, Then Image After Stop
+// VQA Streaming Task - Parallel Audio and Image Transmission
 void vqaStreamTask(void *param) {
-  logInfo("VQA-STREAM", "VQA streaming task started (audio first, then image after stop)");
+  logInfo("VQA-STREAM", "VQA streaming task started (parallel audio and image)");
   
   // Ensure LED reflects streaming state
   digitalWrite(led_pin, HIGH);
@@ -489,15 +451,10 @@ void vqaStreamTask(void *param) {
   const int chunkSizeBytes = (bytesPerSecond * chunkDuration) / 1000;
   
   logDebug("VQA-STREAM", "Stream config: " + String(chunkSizeBytes) + " bytes/chunk, " + 
-           String(chunkDuration) + "ms/chunk, image after audio stops");
+           String(chunkDuration) + "ms/chunk, parallel transmission");
 
-  // Send VQA start header
-  String header = "VQA_START";
-  pCharacteristic->setValue((uint8_t*)header.c_str(), header.length());
-  pCharacteristic->notify();
-  vTaskDelay(pdMS_TO_TICKS(20));
-  logDebug("VQA-STREAM", "Start header sent");
-
+  // No need for VQA_START header - characteristics identify data type
+  
   // Initialize streaming state
   vqaState.audioStreamingActive = true;
   vqaState.streamStartTime = millis();
@@ -505,16 +462,30 @@ void vqaStreamTask(void *param) {
   bool streamingSuccess = true;
 
   // ============================================================================
-  // STEP 1: Stream Audio Continuously Until Stop Requested
+  // STEP 1: Start Image Capture Task (runs in parallel)
+  // ============================================================================
+  TaskHandle_t imageCaptureTaskHandle = nullptr;
+  BaseType_t imageTaskResult = xTaskCreatePinnedToCore(
+    imageCaptureTask, 
+    "ImageCaptureTask", 
+    8192, 
+    nullptr, 
+    1, // Same priority as VQA task
+    &imageCaptureTaskHandle, 
+    0  // Core 0 (different from main VQA task)
+  );
+  
+  if (imageTaskResult != pdPASS) {
+    logError("VQA-STREAM", "Failed to start image capture task");
+    streamingSuccess = false;
+  } else {
+    logInfo("VQA-STREAM", "Image capture task started on Core 0");
+  }
+
+  // ============================================================================
+  // STEP 2: Stream Audio Continuously (parallel with image)
   // ============================================================================
   logInfo("VQA-STREAM", "Starting continuous audio streaming...");
-  
-  // Audio header
-  String audioHeader = "A_START";  // Audio stream start marker
-  pCharacteristic->setValue((uint8_t*)audioHeader.c_str(), audioHeader.length());
-  pCharacteristic->notify();
-  vTaskDelay(pdMS_TO_TICKS(20));
-  logDebug("VQA-STREAM", "Audio header sent");
 
   while (!vqaState.stopRequested && streamingSuccess && deviceConnected) {
     chunkNumber++;
@@ -551,13 +522,12 @@ void vqaStreamTask(void *param) {
               String(bytesRead) + "/" + String(chunkSizeBytes) + " bytes");
     }
 
-    // Only send if we have data and not stopping
+    // Send audio data directly via audio characteristic (no headers needed)
     if (bytesRead > 0 && !vqaState.stopRequested) {
-      // Send chunk data directly in BLE-sized packets (no header needed)
       for (size_t i = 0; i < bytesRead && !vqaState.stopRequested; i += negotiatedChunkSize) {
         size_t packetSize = min((size_t)negotiatedChunkSize, bytesRead - i);
-        pCharacteristic->setValue(chunkBuffer + i, packetSize);
-        pCharacteristic->notify();
+        pAudioCharacteristic->setValue(chunkBuffer + i, packetSize);
+        pAudioCharacteristic->notify();
         vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
         
         // Check if client disconnected during streaming
@@ -569,7 +539,7 @@ void vqaStreamTask(void *param) {
       }
 
       vqaState.totalAudioStreamed += bytesRead;
-      logStreamingProgress("VQA-STREAM", bytesRead, vqaState.totalAudioStreamed, vqaState.streamStartTime, chunkNumber);
+      logStreamingProgress("VQA-AUDIO", bytesRead, vqaState.totalAudioStreamed, vqaState.streamStartTime, chunkNumber);
     }
 
     // Clean up chunk buffer
@@ -582,13 +552,6 @@ void vqaStreamTask(void *param) {
   vqaState.audioStreamingActive = false;
   vqaState.audioRecordingComplete = true;
 
-  // Send audio end signal
-  String audioEndHeader = "A_END";
-  pCharacteristic->setValue((uint8_t*)audioEndHeader.c_str(), audioEndHeader.length());
-  pCharacteristic->notify();
-  vTaskDelay(pdMS_TO_TICKS(20));
-  logDebug("VQA-STREAM", "Audio end sent");
-
   unsigned long audioTime = millis() - vqaState.streamStartTime;
   float avgRate = (vqaState.totalAudioStreamed / 1024.0) / (audioTime / 1000.0);
   
@@ -597,86 +560,24 @@ void vqaStreamTask(void *param) {
           "ms (" + String(avgRate, 1) + " KB/s avg)");
 
   // ============================================================================
-  // STEP 2: Capture and Send Image (only after audio streaming stops)
+  // STEP 3: Wait for Image Task to Complete
   // ============================================================================
-  if (streamingSuccess && deviceConnected) {
-    logInfo("VQA-STREAM", "Starting image capture after audio streaming stopped...");
-    
-    // Take picture
-    camera_fb_t *fb = esp_camera_fb_get();
-    
-    // Retry once if first capture fails
-    if (!fb) {
-      logWarn("VQA-STREAM", "First capture failed, retrying...");
-      vTaskDelay(pdMS_TO_TICKS(50));
-      fb = esp_camera_fb_get();
-      if (!fb) {
-        logError("VQA-STREAM", "Camera capture failed after retry");
-        streamingSuccess = false;
-      }
+  if (imageCaptureTaskHandle && streamingSuccess) {
+    logInfo("VQA-STREAM", "Waiting for image capture task to complete...");
+    // Wait for image task to finish (with timeout)
+    unsigned long waitStart = millis();
+    while (eTaskGetState(imageCaptureTaskHandle) != eDeleted && (millis() - waitStart) < 10000) {
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
-
-    if (fb && streamingSuccess) {
-      size_t imageSize = fb->len;
-      uint8_t *imageBuffer = fb->buf;
-      logInfo("VQA-STREAM", "Captured " + String(imageSize) + " bytes (" + 
-              String(imageSize/1024) + " KB)");
-
-      // Send image data via BLE
-      logInfo("VQA-STREAM", "Starting image transmission...");
-      
-      // Image header
-      String imageHeader = "I:" + String(imageSize);
-      pCharacteristic->setValue((uint8_t*)imageHeader.c_str(), imageHeader.length());
-      pCharacteristic->notify();
-      vTaskDelay(pdMS_TO_TICKS(20));
-      logDebug("VQA-STREAM", "Image header sent");
-
-      // Send image chunks
-      size_t sentBytes = 0;
-      unsigned long transferStart = millis();
-      
-      for (size_t i = 0; i < imageSize && deviceConnected; i += negotiatedChunkSize) {
-        int len = (i + negotiatedChunkSize > imageSize) ? (imageSize - i) : negotiatedChunkSize;
-        pCharacteristic->setValue(imageBuffer + i, len);
-        pCharacteristic->notify();
-        sentBytes += len;
-        vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
-          
-        logProgressRate("VQA-IMG", sentBytes, imageSize, transferStart);
-        
-        // Check if client disconnected during image transfer
-        if (!deviceConnected) {
-          logWarn("VQA-STREAM", "Client disconnected during image transfer");
-          streamingSuccess = false;
-          break;
-        }
-      }
-
-      if (streamingSuccess && deviceConnected) {
-        unsigned long imageTransferTime = millis() - transferStart;
-        float imageTransferRate = (imageSize / 1024.0) / (imageTransferTime / 1000.0);
-        
-        // Image footer
-        String imageFooter = "I_END";
-        pCharacteristic->setValue((uint8_t*)imageFooter.c_str(), imageFooter.length());
-        pCharacteristic->notify();
-        vTaskDelay(pdMS_TO_TICKS(20));
-        logDebug("VQA-STREAM", "Image footer sent");
-
-        logInfo("VQA-STREAM", "Image transfer complete in " + String(imageTransferTime) + 
-                "ms (" + String(imageTransferRate, 1) + " KB/s)");
-        
-        vqaState.imageTransmissionComplete = true;
-      }
-
-      // Release camera frame buffer
-      esp_camera_fb_return(fb);
+    
+    if (eTaskGetState(imageCaptureTaskHandle) != eDeleted) {
+      logWarn("VQA-STREAM", "Image task did not complete, force deleting");
+      vTaskDelete(imageCaptureTaskHandle);
     }
   }
 
   // ============================================================================
-  // STEP 3: Finalize VQA Operation
+  // STEP 4: Finalize VQA Operation
   // ============================================================================
   
   // Determine completion status
@@ -689,12 +590,9 @@ void vqaStreamTask(void *param) {
     stopReason = "Stream error";
   }
 
-  // Send completion footer
+  // Send completion notification via debug log only
   if (streamingSuccess || vqaState.stopRequested) {
-    String footer = "VQA_END";
-    pCharacteristic->setValue((uint8_t*)footer.c_str(), footer.length());
-    pCharacteristic->notify();
-    logDebug("VQA-STREAM", "VQA footer sent");
+    logDebug("VQA-STREAM", "VQA operation completed");
 
     unsigned long totalTime = millis() - vqaState.streamStartTime;
     
@@ -703,9 +601,6 @@ void vqaStreamTask(void *param) {
     logInfo("VQA-STREAM", "Audio streamed: " + String(vqaState.totalAudioStreamed/1024.0, 1) + " KB");
     logInfo("VQA-STREAM", "Image captured: " + String(vqaState.imageTransmissionComplete ? "Yes" : "No"));
   } else {
-    String errorFooter = "VQA_ERR";
-    pCharacteristic->setValue((uint8_t*)errorFooter.c_str(), errorFooter.length());
-    pCharacteristic->notify();
     logError("VQA-STREAM", "VQA streaming failed: " + stopReason);
   }
 
@@ -722,23 +617,101 @@ void vqaStreamTask(void *param) {
   vTaskDelete(NULL);
 }
 
+// Image Capture Task - Runs in parallel with audio streaming
+void imageCaptureTask(void *param) {
+  logInfo("VQA-IMAGE", "Image capture task started");
+  
+  // Small delay to let audio streaming start first
+  vTaskDelay(pdMS_TO_TICKS(100));
+  
+  // Take picture
+  camera_fb_t *fb = esp_camera_fb_get();
+  
+  // Retry once if first capture fails
+  if (!fb) {
+    logWarn("VQA-IMAGE", "First capture failed, retrying...");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      logError("VQA-IMAGE", "Camera capture failed after retry");
+      vTaskDelete(NULL);
+      return;
+    }
+  }
+
+  if (fb && deviceConnected) {
+    size_t imageSize = fb->len;
+    uint8_t *imageBuffer = fb->buf;
+    logInfo("VQA-IMAGE", "Captured " + String(imageSize) + " bytes (" + 
+            String(imageSize/1024) + " KB)");
+
+    // Send image data via BLE using image characteristic (no headers needed)
+    logInfo("VQA-IMAGE", "Starting image transmission...");
+    
+    // Send image chunks
+    size_t sentBytes = 0;
+    unsigned long transferStart = millis();
+    
+    for (size_t i = 0; i < imageSize && deviceConnected; i += negotiatedChunkSize) {
+      int len = (i + negotiatedChunkSize > imageSize) ? (imageSize - i) : negotiatedChunkSize;
+      pImageCharacteristic->setValue(imageBuffer + i, len);
+      pImageCharacteristic->notify();
+      sentBytes += len;
+      vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
+        
+      logProgressRate("VQA-IMAGE", sentBytes, imageSize, transferStart);
+      
+      // Only check for client disconnection, not stop request
+      if (!deviceConnected) {
+        logWarn("VQA-IMAGE", "Client disconnected during image transfer");
+        break;
+      }
+    }
+
+    if (deviceConnected && sentBytes == imageSize) {
+      unsigned long imageTransferTime = millis() - transferStart;
+      float imageTransferRate = (imageSize / 1024.0) / (imageTransferTime / 1000.0);
+      
+      logInfo("VQA-IMAGE", "Image transfer complete in " + String(imageTransferTime) + 
+              "ms (" + String(imageTransferRate, 1) + " KB/s)");
+      
+      vqaState.imageTransmissionComplete = true;
+    }
+
+    // Release camera frame buffer
+    esp_camera_fb_return(fb);
+  }
+  
+  logInfo("VQA-IMAGE", "Image capture task completed");
+  
+  // Task auto-cleanup
+  vTaskDelete(NULL);
+}
+
 // Temperature Task
 void temperatureTask(void *param) {
   while (true) {
     float currentTemp = temperatureRead();
-    
-    // Always check for overheat protection (even when monitoring disabled)
+
+    // Safety shutdown
     if (currentTemp > tempThreshold) {
       logError("TEMP", "Overheat detected! Turning off Device");
       esp_deep_sleep_start();
     }
-    
-    // Only log when monitoring is enabled
+
+    // Always send to Flutter when connected
+    if (deviceConnected) {
+      char buffer[16]; // Enough for header + float
+      snprintf(buffer, sizeof(buffer), "T:%.2f", currentTemp);
+      pTempCharacteristic->setValue((uint8_t*)buffer, strlen(buffer));
+      pTempCharacteristic->notify();
+    }
+
     if (tempMonitoringEnabled) {
       logDebug("TEMP", "Current temperature: " + String(currentTemp, 1) + " °C");
     }
-    
-    vTaskDelay(pdMS_TO_TICKS(1000)); // check every 1 sec
+
+    vTaskDelay(pdMS_TO_TICKS(10000)); // every 1 sec
   }
 }
 
@@ -749,7 +722,7 @@ void temperatureTask(void *param) {
 // ============================================================================
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(9600); // Match the simple button example
     delay(1000);
     
     // Welcome
@@ -757,10 +730,10 @@ void setup() {
     logInfo("SYS", "Compile time: " + String(__DATE__) + " " + String(__TIME__));
     logMemory("SYS");
 
-    // Setup touch/LED pins
+    // Setup button and LED pins
     pinMode(led_pin, OUTPUT);
     digitalWrite(led_pin, LOW);
-    pinMode(touch_pin, INPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLUP); // Button input with internal pullup
 
     // Initialize BLE only
     initBLE();
@@ -780,88 +753,24 @@ void setup() {
 // ============================================================================
 
 void loop() {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
   // -----------------------------
-  // Touch sensor handling (rising edge -> toggle VQA) for testing
+  // Button handling (press = start VQA, release = stop VQA)
   // -----------------------------
-  if (touchEnabled) {
-    int touchValue = analogRead(touch_pin);
-    bool isTouched = (touchValue > threshold);
-
-    // Optional: debug touch values occasionally
-    static unsigned long lastTouchDebug = 0;
-    if (millis() - lastTouchDebug > 2000) {
-      lastTouchDebug = millis();
-      logDebug("TOUCH", "Value: " + String(touchValue));
-    }
-
-    // Rising edge detection with debounce
-    if (isTouched && !lastTouch && (millis() - lastTouchMillis) > TOUCH_DEBOUNCE_MS) {
-      lastTouchMillis = millis();
-
-      // Toggle VQA start/stop
-      if (!deviceConnected) {
-        logWarn("TOUCH", "Touch ignored - BLE not connected");
-      } else if (!systemInitialized) {
-        logWarn("TOUCH", "Touch ignored - system not initialized");
-      } else {
-        if (!vqaState.isRunning) {
-          // Start VQA streaming (same logic as BLE/serial command)
-          vqaState.stopRequested = false;
-          BaseType_t result = xTaskCreatePinnedToCore(
-            vqaStreamTask, 
-            "VQAStreamTask", 
-            20480, 
-            nullptr, 
-            1, // Normal priority
-            &vqaState.vqaTaskHandle, 
-            1  // Core 1
-          );
-          if (result == pdPASS) {
-            logInfo("TOUCH", "VQA streaming started via touch");
-            digitalWrite(led_pin, HIGH);
-            ledState = true;
-          } else {
-            logError("TOUCH", "Failed to start VQA streaming task via touch");
-          }
-        } else {
-          // Request stop
-          vqaState.stopRequested = true;
-          logInfo("TOUCH", "VQA streaming stop requested via touch");
-        }
-      }
-    }
-
-    lastTouch = isTouched;
-  }
-
-  // -----------------------------
-  // Serial Commands for testing - VQA only
-  // -----------------------------
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    cmd.toUpperCase();
-
-    if (cmd == "VQA_START") {
-      if (!deviceConnected) {
-        logWarn("CMD", "VQA streaming ignored - BLE not connected");
-      } else if (systemInitialized) {
-        if (!vqaState.isRunning) {
+  int buttonState = digitalRead(BUTTON_PIN);
+  
+  // Debouncing - only process if enough time has passed since last change
+  if ((millis() - lastButtonChange) > BUTTON_DEBOUNCE_MS) {
+    // Check for button state change
+    if (buttonState != lastButtonState) {
+      lastButtonChange = millis();
+      
+      // Button pressed (HIGH to LOW transition)
+      if (buttonState == LOW && lastButtonState == HIGH) {
+        if (!deviceConnected) {
+          logWarn("BUTTON", "Button press ignored - BLE not connected");
+        } else if (!systemInitialized) {
+          logWarn("BUTTON", "Button press ignored - system not initialized");
+        } else if (!vqaState.isRunning) {
           // Start VQA streaming
           vqaState.stopRequested = false;
           BaseType_t result = xTaskCreatePinnedToCore(
@@ -874,52 +783,28 @@ void loop() {
             1  // Core 1
           );
           if (result == pdPASS) {
-            logInfo("CMD", "VQA streaming started via serial");
+            logInfo("BUTTON", "VQA streaming started - button pressed");
             digitalWrite(led_pin, HIGH);
             ledState = true;
           } else {
-            logError("CMD", "Failed to start VQA streaming task via serial");
+            logError("BUTTON", "Failed to start VQA streaming task");
           }
         } else {
-          logWarn("CMD", "VQA streaming already active");
+          logWarn("BUTTON", "VQA streaming already active");
         }
-      } else {
-        logWarn("CMD", "VQA streaming ignored - system not initialized");
       }
-    }
-    else if (cmd == "VQA_STOP") {
-      if (vqaState.isRunning) {
-        vqaState.stopRequested = true;
-        logInfo("CMD", "VQA streaming stop requested via serial");
-      } else {
-        logWarn("CMD", "No VQA streaming active to stop");
+      
+      // Button released (LOW to HIGH transition)
+      else if (buttonState == HIGH && lastButtonState == LOW) {
+        if (vqaState.isRunning) {
+          vqaState.stopRequested = true;
+          logInfo("BUTTON", "VQA streaming stop requested - button released");
+        } else {
+          logInfo("BUTTON", "Button released - no active VQA to stop");
+        }
       }
-    }
-    else if (cmd == "STATUS") {
-      logInfo("SYS", "=== System Status ===");
-      logInfo("SYS", "BLE connected: " + String(deviceConnected ? "Yes" : "No"));
-      logInfo("SYS", "System initialized: " + String(systemInitialized ? "Yes" : "No"));
-      logInfo("SYS", "VQA running: " + String(vqaState.isRunning ? "Yes" : "No"));
-      logInfo("SYS", "Temperature monitoring: " + String(tempMonitoringEnabled ? "Enabled" : "Disabled"));
-      logInfo("SYS", "Touch commands: " + String(touchEnabled ? "Enabled" : "Disabled"));
-      logInfo("SYS", "Chunk size: " + String(negotiatedChunkSize) + " bytes");
-      logMemory("SYS");
-    }
-    else if (cmd == "DEBUG") {
-      currentLogLevel = (currentLogLevel == LOG_DEBUG) ? LOG_INFO : LOG_DEBUG;
-      logInfo("SYS", "Debug logging " + String(currentLogLevel == LOG_DEBUG ? "enabled" : "disabled"));
-    }
-    else if (cmd == "TEMP") {
-      tempMonitoringEnabled = !tempMonitoringEnabled;
-      logInfo("CMD", "Temperature monitoring " + String(tempMonitoringEnabled ? "enabled" : "disabled") + " via serial (overheat protection always active)");
-    }
-    else if (cmd == "TOUCH") {
-      touchEnabled = !touchEnabled;
-      logInfo("CMD", "Touch commands " + String(touchEnabled ? "enabled" : "disabled") + " via serial");
-    }
-    else if (cmd.length() > 0) {
-      logWarn("CMD", "Unknown serial command: '" + cmd + "'");
-      logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP, TOUCH");
+      
+      lastButtonState = buttonState;
     }
   }
 
@@ -944,7 +829,7 @@ void printWelcomeArt() {
     "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⡀⢀⠀⠀⣸⣿⠁⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
     "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢙⣿⣶⡄⡾⠟⠃⠀⠀⣾⡏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⠿⣯⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
     "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⠃⠀⠀⠀⠀⠀⠀⣴⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠘⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⢀⡀⡀⣀⣀⣀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀⠀⠊⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠀⠀⠀⣤⣾⠿⠛⠃⠀⠀⠀⣸⣷⠀⠀⠀⠀⣀⣀⡀⡀⠀",
+    "⢀⡀⡀⣀⣀⣀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀⠀⠊⠀⠀⠀⠀⠀⢀⣀⠀⠀⠀⠀⣤⣾⠿⠛⠃⠀⠀⠀⣸⣷⠀⠀⠀⠀⣀⣀⡀⡀⠀",
     "⠺⠿⠛⠛⠛⠛⠿⠿⠿⠿⠿⠿⠿⠿⠿⠷⣶⢶⡶⡶⠶⠿⠿⠿⠿⠟⠛⠛⠻⠿⠿⠿⢿⣿⣀⣠⣤⣤⣤⣤⣶⠿⠛⠛⠛⠛⠛⠛⠛⠛⠻⠃",
     "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠉⠉⠉⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
   };
