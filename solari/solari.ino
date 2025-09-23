@@ -16,20 +16,19 @@
 #define VQA_STREAM_CHUNK_DURATION_MS 150  // 500ms chunks for VQA streaming
 #define VQA_STREAM_BUFFER_COUNT 4         // Number of buffers for smooth streaming
 
+#define BUTTON_PIN D10
+
 
 
 // ============================================================================
-// Touch Globals
+// LED and Button Globals
 // ============================================================================
-const int touch_pin = A5;        // Touch sensor pin
 const int led_pin = LED_BUILTIN; // On-board LED
 
 bool ledState = false;     // indicator LED state (mirrors vqa running)
-bool lastTouch = false;    // Previous touch state
-int threshold = 2000;      // Adjust based on your sensor values
-unsigned long lastTouchMillis = 0;
-const unsigned long TOUCH_DEBOUNCE_MS = 200; // extra safety debounce
-bool touchEnabled = false;  // Enable/disable touch commands
+bool lastButtonState = HIGH; // Previous button state (HIGH = not pressed due to pullup)
+unsigned long lastButtonMillis = 0;
+const unsigned long BUTTON_DEBOUNCE_MS = 200; // Button debounce time
 
 
 
@@ -212,60 +211,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
 };
 
 class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
-    String value = String(characteristic->getValue().c_str());
-    value.trim();
-    value.toUpperCase();
-
-    // Raw Inputs
-    logDebug("BLE", "Raw received: '" + value + "'");
-    // Commands
-    if (value == "VQA_START") {
-      if (systemInitialized) {
-        if (!vqaState.isRunning) {
-          // Start VQA streaming
-          vqaState.stopRequested = false;
-          BaseType_t result = xTaskCreatePinnedToCore(
-            vqaStreamTask, 
-            "VQAStreamTask", 
-            20480, 
-            nullptr, 
-            1, // Normal priority
-            &vqaState.vqaTaskHandle, 
-            1  // Core 1
-          );
-          if (result == pdPASS) {
-            logInfo("CMD", "VQA streaming started");
-          } else {
-            logError("CMD", "Failed to start VQA streaming task");
-          }
-        } else {
-          logWarn("CMD", "VQA streaming already active");
-        }
-      } else {
-        logWarn("CMD", "VQA streaming ignored - system not initialized");
-      }
-    }
-    else if (value == "VQA_STOP") {
-      if (vqaState.isRunning) {
-        vqaState.stopRequested = true;
-        logInfo("CMD", "VQA streaming stop requested");
-      } else {
-        logWarn("CMD", "No VQA streaming active to stop");
-      }
-    }
-    else if (value == "TEMP") {
-      tempMonitoringEnabled = !tempMonitoringEnabled;
-      logInfo("CMD", "Temperature monitoring " + String(tempMonitoringEnabled ? "enabled" : "disabled") + " (overheat protection always active)");
-    }
-    else if (value == "TOUCH") {
-      touchEnabled = !touchEnabled;
-      logInfo("CMD", "Touch commands " + String(touchEnabled ? "enabled" : "disabled"));
-    }
-    else {
-      logWarn("CMD", "Unknown command received: '" + value + "'");
-    }
-  }
+  // No onWrite method - all commands handled via serial only
 };
 
 
@@ -774,10 +720,10 @@ void setup() {
     logInfo("SYS", "Compile time: " + String(__DATE__) + " " + String(__TIME__));
     logMemory("SYS");
 
-    // Setup touch/LED pins
+    // Setup LED and button pins
     pinMode(led_pin, OUTPUT);
     digitalWrite(led_pin, LOW);
-    pinMode(touch_pin, INPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLUP); // Button input with pullup
 
     // Initialize BLE only
     initBLE();
@@ -797,74 +743,61 @@ void setup() {
 // ============================================================================
 
 void loop() {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
   // -----------------------------
-  // Touch sensor handling (rising edge -> toggle VQA) for testing
+  // Button handling (press to start, release to stop VQA)
   // -----------------------------
-  if (touchEnabled) {
-    int touchValue = analogRead(touch_pin);
-    bool isTouched = (touchValue > threshold);
+  int buttonState = digitalRead(BUTTON_PIN);
+  
+  // Optional: debug button values occasionally
+  static unsigned long lastButtonDebug = 0;
+  if (millis() - lastButtonDebug > 2000) {
+    lastButtonDebug = millis();
+  }
 
-    // Optional: debug touch values occasionally
-    static unsigned long lastTouchDebug = 0;
-    if (millis() - lastTouchDebug > 2000) {
-      lastTouchDebug = millis();
-      logDebug("TOUCH", "Value: " + String(touchValue));
-    }
+  // Detect state changes with debounce
+  if (buttonState != lastButtonState && (millis() - lastButtonMillis) > BUTTON_DEBOUNCE_MS) {
+    lastButtonMillis = millis();
 
-    // Rising edge detection with debounce
-    if (isTouched && !lastTouch && (millis() - lastTouchMillis) > TOUCH_DEBOUNCE_MS) {
-      lastTouchMillis = millis();
-
-      // Toggle VQA start/stop
+    if (buttonState == LOW) {
+      // Button pressed - start VQA
       if (!deviceConnected) {
-        logWarn("TOUCH", "Touch ignored - BLE not connected");
+        logWarn("BUTTON", "Button press ignored - BLE not connected");
       } else if (!systemInitialized) {
-        logWarn("TOUCH", "Touch ignored - system not initialized");
-      } else {
-        if (!vqaState.isRunning) {
-          // Start VQA streaming (same logic as BLE/serial command)
-          vqaState.stopRequested = false;
-          BaseType_t result = xTaskCreatePinnedToCore(
-            vqaStreamTask, 
-            "VQAStreamTask", 
-            20480, 
-            nullptr, 
-            1, // Normal priority
-            &vqaState.vqaTaskHandle, 
-            1  // Core 1
-          );
-          if (result == pdPASS) {
-            logInfo("TOUCH", "VQA streaming started via touch");
-            digitalWrite(led_pin, HIGH);
-            ledState = true;
-          } else {
-            logError("TOUCH", "Failed to start VQA streaming task via touch");
-          }
+        logWarn("BUTTON", "Button press ignored - system not initialized");
+      } else if (!vqaState.isRunning) {
+        // Start VQA streaming
+        vqaState.stopRequested = false;
+        BaseType_t result = xTaskCreatePinnedToCore(
+          vqaStreamTask, 
+          "VQAStreamTask", 
+          20480, 
+          nullptr, 
+          1, // Normal priority
+          &vqaState.vqaTaskHandle, 
+          1  // Core 1
+        );
+        if (result == pdPASS) {
+          logInfo("BUTTON", "VQA streaming started - button pressed");
+          digitalWrite(led_pin, HIGH);
+          ledState = true;
         } else {
-          // Request stop
-          vqaState.stopRequested = true;
-          logInfo("TOUCH", "VQA streaming stop requested via touch");
+          logError("BUTTON", "Failed to start VQA streaming task");
         }
+      } else {
+        logWarn("BUTTON", "VQA already running");
+      }
+    } else {
+      // Button released - stop VQA
+      if (vqaState.isRunning) {
+        vqaState.stopRequested = true;
+        logInfo("BUTTON", "VQA streaming stop requested - button released");
+      } else {
+        logDebug("BUTTON", "Button released - no VQA to stop");
       }
     }
-
-    lastTouch = isTouched;
   }
+
+  lastButtonState = buttonState;
 
   // -----------------------------
   // Serial Commands for testing - VQA only
@@ -918,7 +851,6 @@ void loop() {
       logInfo("SYS", "System initialized: " + String(systemInitialized ? "Yes" : "No"));
       logInfo("SYS", "VQA running: " + String(vqaState.isRunning ? "Yes" : "No"));
       logInfo("SYS", "Temperature monitoring: " + String(tempMonitoringEnabled ? "Enabled" : "Disabled"));
-      logInfo("SYS", "Touch commands: " + String(touchEnabled ? "Enabled" : "Disabled"));
       logInfo("SYS", "Chunk size: " + String(negotiatedChunkSize) + " bytes");
       logMemory("SYS");
     }
@@ -930,13 +862,9 @@ void loop() {
       tempMonitoringEnabled = !tempMonitoringEnabled;
       logInfo("CMD", "Temperature monitoring " + String(tempMonitoringEnabled ? "enabled" : "disabled") + " via serial (overheat protection always active)");
     }
-    else if (cmd == "TOUCH") {
-      touchEnabled = !touchEnabled;
-      logInfo("CMD", "Touch commands " + String(touchEnabled ? "enabled" : "disabled") + " via serial");
-    }
     else if (cmd.length() > 0) {
       logWarn("CMD", "Unknown serial command: '" + cmd + "'");
-      logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP, TOUCH");
+      logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP");
     }
   }
 
