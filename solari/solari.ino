@@ -9,8 +9,6 @@
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define TEMP_CHARACTERISTIC_UUID "00002A6E-0000-1000-8000-00805F9B34FB"
-#define IMAGE_CHARACTERISTIC_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-#define AUDIO_CHARACTERISTIC_UUID "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
 
 #define CAPTURE_DEBOUNCE_MS 500
 #define SEND_DELAY_BETWEEN_CHUNKS_MS 15
@@ -50,8 +48,6 @@ bool deviceConnected = false;
 bool systemInitialized = false;
 BLECharacteristic* pCharacteristic;
 BLECharacteristic* pTempCharacteristic;
-BLECharacteristic* pImageCharacteristic;
-BLECharacteristic* pAudioCharacteristic;
 int negotiatedChunkSize = 23;
 I2SClass i2s;
 
@@ -326,13 +322,13 @@ void initCamera() {
   // FRAMESIZE_HD - 1280x720 
   // FRAMESIZE_UXGA - 1600x1200
   // FRAMESIZE_QSXGA - 2592x1944
-  config.frame_size = FRAMESIZE_HD; 
+  config.frame_size = FRAMESIZE_XGA; 
   // ------------------------------------------
 
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = psramFound() ? 4 : 8;
+  config.jpeg_quality = psramFound() ? 10 : 12;
   config.fb_count = psramFound() ? 2 : 1;
 
   logDebug("CAM", "PSRAM found: " + String(psramFound() ? "Yes" : "No"));
@@ -401,20 +397,6 @@ void initBLE() {
         BLECharacteristic::PROPERTY_NOTIFY
     );
     pTempCharacteristic->addDescriptor(new BLE2902());
-
-    // Image Characteristic
-    pImageCharacteristic = pService->createCharacteristic(
-        IMAGE_CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pImageCharacteristic->addDescriptor(new BLE2902());
-
-    // Audio Characteristic
-    pAudioCharacteristic = pService->createCharacteristic(
-        AUDIO_CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pAudioCharacteristic->addDescriptor(new BLE2902());
 
     pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
     pService->start();
@@ -485,8 +467,8 @@ void vqaStreamTask(void *param) {
   
   // Audio header
   String audioHeader = "A_START";  // Audio stream start marker
-  pAudioCharacteristic->setValue((uint8_t*)audioHeader.c_str(), audioHeader.length());
-  pAudioCharacteristic->notify();
+  pCharacteristic->setValue((uint8_t*)audioHeader.c_str(), audioHeader.length());
+  pCharacteristic->notify();
   vTaskDelay(pdMS_TO_TICKS(20));
   logDebug("VQA-STREAM", "Audio header sent");
 
@@ -530,8 +512,8 @@ void vqaStreamTask(void *param) {
       // Send chunk data directly in BLE-sized packets (no header needed)
       for (size_t i = 0; i < bytesRead && !vqaState.stopRequested; i += negotiatedChunkSize) {
         size_t packetSize = min((size_t)negotiatedChunkSize, bytesRead - i);
-        pAudioCharacteristic->setValue(chunkBuffer + i, packetSize);
-        pAudioCharacteristic->notify();
+        pCharacteristic->setValue(chunkBuffer + i, packetSize);
+        pCharacteristic->notify();
         vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
         
         // Check if client disconnected during streaming
@@ -558,8 +540,8 @@ void vqaStreamTask(void *param) {
 
   // Send audio end signal
   String audioEndHeader = "A_END";
-  pAudioCharacteristic->setValue((uint8_t*)audioEndHeader.c_str(), audioEndHeader.length());
-  pAudioCharacteristic->notify();
+  pCharacteristic->setValue((uint8_t*)audioEndHeader.c_str(), audioEndHeader.length());
+  pCharacteristic->notify();
   vTaskDelay(pdMS_TO_TICKS(20));
   logDebug("VQA-STREAM", "Audio end sent");
 
@@ -601,8 +583,8 @@ void vqaStreamTask(void *param) {
       
       // Image header
       String imageHeader = "I:" + String(imageSize);
-      pImageCharacteristic->setValue((uint8_t*)imageHeader.c_str(), imageHeader.length());
-      pImageCharacteristic->notify();
+      pCharacteristic->setValue((uint8_t*)imageHeader.c_str(), imageHeader.length());
+      pCharacteristic->notify();
       vTaskDelay(pdMS_TO_TICKS(20));
       logDebug("VQA-STREAM", "Image header sent");
 
@@ -612,8 +594,8 @@ void vqaStreamTask(void *param) {
       
       for (size_t i = 0; i < imageSize && deviceConnected; i += negotiatedChunkSize) {
         int len = (i + negotiatedChunkSize > imageSize) ? (imageSize - i) : negotiatedChunkSize;
-        pImageCharacteristic->setValue(imageBuffer + i, len);
-        pImageCharacteristic->notify();
+        pCharacteristic->setValue(imageBuffer + i, len);
+        pCharacteristic->notify();
         sentBytes += len;
         vTaskDelay(pdMS_TO_TICKS(SEND_DELAY_BETWEEN_CHUNKS_MS));
           
@@ -633,8 +615,8 @@ void vqaStreamTask(void *param) {
         
         // Image footer
         String imageFooter = "I_END";
-        pImageCharacteristic->setValue((uint8_t*)imageFooter.c_str(), imageFooter.length());
-        pImageCharacteristic->notify();
+        pCharacteristic->setValue((uint8_t*)imageFooter.c_str(), imageFooter.length());
+        pCharacteristic->notify();
         vTaskDelay(pdMS_TO_TICKS(20));
         logDebug("VQA-STREAM", "Image footer sent");
 
