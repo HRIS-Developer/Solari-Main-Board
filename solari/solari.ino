@@ -5,18 +5,20 @@
   #include "ESP_I2S.h"
   #include "esp_adc_cal.h"
   #include <BLE2902.h>
+  #include <vector>
 
   #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
   #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
   #define TEMP_CHARACTERISTIC_UUID "00002A6E-0000-1000-8000-00805F9B34FB"
+  #define SPEAKER_CHARACTERISTIC_UUID "12345678-1234-1234-1234-123456789abc"
 
   #define CAPTURE_DEBOUNCE_MS 500
-  #define SEND_DELAY_BETWEEN_CHUNKS_MS 15
+  #define SEND_DELAY_BETWEEN_CHUNKS_MS 8
 
   #define VQA_STREAM_CHUNK_DURATION_MS 150  // 500ms chunks for VQA streaming
   #define VQA_STREAM_BUFFER_COUNT 4         // Number of buffers for smooth streaming
 
-  #define BUTTON_PIN D10
+  #define BUTTON_PIN D4
 
 
 
@@ -48,6 +50,7 @@
   bool systemInitialized = false;
   BLECharacteristic* pCharacteristic;
   BLECharacteristic* pTempCharacteristic;
+  BLECharacteristic* pSpeakerCharacteristic;
   int negotiatedChunkSize = 23;
   I2SClass i2s;
 
@@ -71,6 +74,31 @@
     unsigned long streamStartTime = 0;
   };
   VQAState vqaState;
+
+  // ============================================================================
+  // Speaker Audio Globals
+  // ============================================================================
+  struct SpeakerAudioState {
+    bool receivingAudio = false;
+    bool audioLoadingComplete = false;
+    bool isPlaying = false;
+    bool streamingEnabled = false;  // New: Enable real-time streaming
+    size_t expectedAudioSize = 0;
+    size_t receivedAudioSize = 0;
+    size_t playPosition = 0;
+    size_t streamThreshold = 10240;  // Start playing after 10KB buffer
+    unsigned long audioReceiveStartTime = 0;
+    unsigned long lastSampleTime = 0;
+    std::vector<uint8_t> audioBuffer;
+    TaskHandle_t audioPlaybackTaskHandle = nullptr;
+    int16_t amplitude = 32767;  // Volume control
+  };
+  SpeakerAudioState speakerAudioState;
+
+  // No longer need A-Law decompression - using direct 16-bit PCM for superior quality
+
+  // I2S instance for speaker output (separate from microphone I2S)
+  I2SClass i2s_speaker;
 
 
 
@@ -216,8 +244,135 @@
       uint8_t* data = pCharacteristic->getData();
       size_t length = pCharacteristic->getLength();
       
-      // Output raw data to serial
-      Serial.print("BLE Data Received: ");
+      // Output raw data to serial for VQA commands
+      Serial.print("VQA BLE Data Received: ");
+      for (size_t i = 0; i < length; i++) {
+        Serial.print("0x");
+        if (data[i] < 16) Serial.print("0");
+        Serial.print(data[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.print("| String: \"");
+      Serial.print(value);
+      Serial.print("\" | Length: ");
+      Serial.println(length);
+    }
+  };
+
+  class MySpeakerCharacteristicCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) override {
+      String value = pCharacteristic->getValue().c_str();
+      uint8_t* data = pCharacteristic->getData();
+      size_t length = pCharacteristic->getLength();
+      
+      // Handle speaker audio headers
+      if (value.startsWith("S_START:")) {
+        speakerAudioState.expectedAudioSize = value.substring(8).toInt();
+        speakerAudioState.receivingAudio = true;
+        speakerAudioState.audioLoadingComplete = false;
+        speakerAudioState.streamingEnabled = false;
+        speakerAudioState.receivedAudioSize = 0;
+        speakerAudioState.playPosition = 0;
+        speakerAudioState.isPlaying = false;
+        speakerAudioState.audioReceiveStartTime = millis();
+        speakerAudioState.audioBuffer.clear();
+        speakerAudioState.audioBuffer.reserve(speakerAudioState.expectedAudioSize);
+        
+        // Clean up any existing streaming task
+        if (speakerAudioState.audioPlaybackTaskHandle != nullptr) {
+          vTaskDelete(speakerAudioState.audioPlaybackTaskHandle);
+          speakerAudioState.audioPlaybackTaskHandle = nullptr;
+        }
+        
+        logInfo("SPEAKER", "Real-time audio streaming started - Expected size: " + String(speakerAudioState.expectedAudioSize) + " bytes");
+        
+        // Turn on LED to indicate audio loading
+        digitalWrite(led_pin, HIGH);
+        ledState = true;
+        return;
+      }
+      
+      if (value.startsWith("S_END")) {
+        speakerAudioState.receivingAudio = false;
+        speakerAudioState.audioLoadingComplete = true;
+        
+        unsigned long loadTime = millis() - speakerAudioState.audioReceiveStartTime;
+        float loadRate = (speakerAudioState.receivedAudioSize / 1024.0) / (loadTime / 1000.0);
+        
+        logInfo("SPEAKER", "Reception complete - " + String(speakerAudioState.receivedAudioSize/1024.0, 1) + 
+                "KB in " + String(loadTime) + "ms (" + String(loadRate, 1) + "KB/s)");
+        
+        if (!speakerAudioState.isPlaying) {
+          // If streaming didn't start (very small audio), play normally
+          logInfo("SPEAKER", "Playing small audio file...");
+          playAudioBuffer();
+          
+          // Turn off LED after playback completes
+          digitalWrite(led_pin, LOW);
+          ledState = false;
+          
+          logInfo("SPEAKER", "Playback complete");
+        } else {
+          logInfo("SPEAKER", "Transmission complete, streaming continues...");
+        }
+        return;
+      }
+      
+      // Handle binary audio data
+      if (speakerAudioState.receivingAudio) {
+        // Append received data to audio buffer
+        for (size_t i = 0; i < length; i++) {
+          speakerAudioState.audioBuffer.push_back(data[i]);
+        }
+        speakerAudioState.receivedAudioSize += length;
+        
+        // Start streaming playback once we have enough buffer
+        if (!speakerAudioState.isPlaying && 
+            speakerAudioState.receivedAudioSize >= speakerAudioState.streamThreshold) {
+          logInfo("SPEAKER", "Real-time streaming started with " + 
+                  String(speakerAudioState.receivedAudioSize/1024.0, 1) + "KB buffered");
+          speakerAudioState.streamingEnabled = true;
+          speakerAudioState.isPlaying = true;
+          
+          // Create streaming playback task
+          xTaskCreate(streamingAudioTask, "StreamAudio", 8192, NULL, 1, 
+                     &speakerAudioState.audioPlaybackTaskHandle);
+        }
+        
+        // Combined progress bar: show both receiving and streaming status
+        if (speakerAudioState.receivedAudioSize % 1024 == 0) { // Log every 1KB
+          unsigned long elapsed = millis() - speakerAudioState.audioReceiveStartTime;
+          float receiveRate = (speakerAudioState.receivedAudioSize / 1024.0) / (elapsed / 1000.0);
+          int percent = (speakerAudioState.receivedAudioSize * 100) / speakerAudioState.expectedAudioSize;
+          
+          // Create unified progress bar
+          const int barWidth = 20;
+          int filled = (percent * barWidth) / 100;
+          String progressBar = "[";
+          
+          for (int i = 0; i < barWidth; i++) {
+            if (i < filled) {
+              progressBar += "█";
+            } else {
+              progressBar += "░";
+            }
+          }
+          progressBar += "]";
+          
+          String status = speakerAudioState.isPlaying ? "STREAMING" : "RECEIVING";
+          float playedSeconds = speakerAudioState.isPlaying ? 
+                              (float)(speakerAudioState.playPosition / 2) / 16000.0 : 0;
+          
+          logInfo("STREAM", status + " " + progressBar + " " + String(percent) + "% | " + 
+                  String(speakerAudioState.receivedAudioSize/1024.0, 1) + "KB @ " + 
+                  String(receiveRate, 1) + "KB/s" + 
+                  (speakerAudioState.isPlaying ? " | " + String(playedSeconds, 1) + "s" : ""));
+        }
+        return;
+      }
+      
+      // Output raw data to serial for debugging
+      Serial.print("Speaker BLE Data Received: ");
       for (size_t i = 0; i < length; i++) {
         Serial.print("0x");
         if (data[i] < 16) Serial.print("0");
@@ -247,6 +402,9 @@
 
     // Initialize Microphone
     initMicrophone();
+
+    // Initialize Speaker
+    initSpeaker();
 
     systemInitialized = true;
     logInfo("SYS", "========================== System initialization complete ==========================");
@@ -287,9 +445,17 @@
     esp_camera_deinit();
     logInfo("SYS", "Camera deinitialized");
     
-    // Stop I2S (microphone)
+    // Reset speaker audio state
+    speakerAudioState.receivingAudio = false;
+    speakerAudioState.audioLoadingComplete = false;
+    speakerAudioState.isPlaying = false;
+    speakerAudioState.playPosition = 0;
+    speakerAudioState.audioBuffer.clear();
+    
+    // Stop I2S (microphone and speaker)
     i2s.end();
-    logInfo("SYS", "Microphone deinitialized");
+    i2s_speaker.end();
+    logInfo("SYS", "Microphone and speaker deinitialized");
     
     systemInitialized = false;
     logInfo("SYS", "========================== System cleanup complete ==========================");
@@ -382,6 +548,29 @@
       logMemory("MIC");
   }
 
+  // ============================================================================
+  // Setup Speaker / I2S Output
+  // ============================================================================
+
+  void initSpeaker() {
+      logInfo("SPEAKER", "Initializing speaker output...");
+      
+      // Set the TX pins for I2S speaker output (based on your test_bread_board.ino)
+      // Using different pins from microphone to avoid conflicts
+      i2s_speaker.setPins(D1, D0, D2);  // BCLK=D1, LRC=D0, DOUT=D2
+      logDebug("SPEAKER", "I2S TX pins configured: BCLK=D1, LRC=D0, DOUT=D2");
+
+      // Begin I2S in TX mode, mono, 16-bit, 16kHz for high-quality PCM audio
+      // Enhanced configuration for better audio quality
+      if (!i2s_speaker.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+          logError("SPEAKER", "I2S speaker initialization failed!");
+          while (true) delay(100);
+      }
+      
+      logInfo("SPEAKER", "Speaker ready - 8kHz, 16-bit, mono");
+      logMemory("SPEAKER");
+  }
+
 
 
   // ============================================================================
@@ -395,18 +584,24 @@
       logInfo("BLE", "Initializing Bluetooth LE...");
       
       BLEDevice::init("XIAO_ESP32S3");
-      BLEDevice::setMTU(223);
+      BLEDevice::setMTU(515);
       BLEServer *pServer = BLEDevice::createServer();
       pServer->setCallbacks(new MyServerCallbacks());
 
       BLEService *pService = pServer->createService(SERVICE_UUID);
 
-      // Service Characteristic
+      // VQA Service Characteristic
       pCharacteristic = pService->createCharacteristic(
           CHARACTERISTIC_UUID,
           BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
       );
       pCharacteristic->addDescriptor(new BLE2902());
+
+      // Speaker Characteristic
+      pSpeakerCharacteristic = pService->createCharacteristic(
+          SPEAKER_CHARACTERISTIC_UUID,
+          BLECharacteristic::PROPERTY_WRITE_NR
+      );
 
       // Temperature Characteristic
       pTempCharacteristic = pService->createCharacteristic(
@@ -416,6 +611,7 @@
       pTempCharacteristic->addDescriptor(new BLE2902());
 
       pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+      pSpeakerCharacteristic->setCallbacks(new MySpeakerCharacteristicCallbacks());
       pService->start();
 
       BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -695,6 +891,202 @@
     vTaskDelete(NULL);
   }
 
+  // Real-time Audio Streaming Task for immediate playback
+  void streamingAudioTask(void *param) {
+    logInfo("STREAM", "Starting real-time audio streaming task");
+    
+    const size_t chunkSize = 512;  // Process in 512-byte chunks for 16kHz PCM
+    const unsigned long targetDelayMs = 16;  // ~16ms between chunks for smooth playback
+    
+    // Anti-click: Send silence first to initialize I2S cleanly
+    const size_t silenceSize = 64;  // Small silence buffer
+    uint8_t silenceBuffer[silenceSize] = {0};  // Zero-filled silence
+    i2s_speaker.write(silenceBuffer, silenceSize);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Brief pause
+    
+    while (true) {
+      // Check if we have enough data to play
+      size_t availableData = speakerAudioState.receivedAudioSize - speakerAudioState.playPosition;
+      
+      if (availableData >= chunkSize || 
+          (speakerAudioState.audioLoadingComplete && availableData > 0)) {
+        
+        size_t bytesToPlay = min(chunkSize, availableData);
+        
+        // Ensure we don't split 16-bit samples
+        if (bytesToPlay % 2 == 1) {
+          bytesToPlay--;
+        }
+        
+        if (bytesToPlay > 0) {
+          // Process and play chunk with volume control and filtering
+          std::vector<uint8_t> processedChunk(bytesToPlay);
+          
+          // Anti-click: Volume ramp for first few chunks
+          static bool isFirstChunk = true;
+          static int rampCounter = 0;
+          const int rampChunks = 5;  // Ramp over 5 chunks (~80ms)
+          
+          for (size_t i = 0; i < bytesToPlay; i += 2) {
+            size_t bufferIndex = speakerAudioState.playPosition + i;
+            
+            // Extract 16-bit sample (little-endian)
+            int16_t sample = speakerAudioState.audioBuffer[bufferIndex] | 
+                            (speakerAudioState.audioBuffer[bufferIndex + 1] << 8);
+            
+            // Apply volume control
+            int32_t adjustedAmplitude = speakerAudioState.amplitude;
+            
+            // Anti-click: Gradual volume ramp for smooth start
+            if (rampCounter < rampChunks) {
+              adjustedAmplitude = (adjustedAmplitude * (rampCounter + 1)) / rampChunks;
+            }
+            
+            sample = (int16_t)((int32_t)sample * adjustedAmplitude / 32767);
+            
+            // Apply simple high-pass filter to reduce DC offset and clicks
+            static int16_t lastSample = 0;
+            int16_t filtered = sample - (lastSample >> 4);  // Simple HPF
+            lastSample = sample;
+            
+            // Store back as little-endian
+            processedChunk[i] = filtered & 0xFF;
+            processedChunk[i + 1] = (filtered >> 8) & 0xFF;
+          }
+          
+          // Increment ramp counter
+          if (rampCounter < rampChunks) {
+            rampCounter++;
+          }
+          
+          // Send chunk to I2S
+          size_t bytesWritten = 0;
+          while (bytesWritten < bytesToPlay) {
+            size_t written = i2s_speaker.write(processedChunk.data() + bytesWritten, 
+                                             bytesToPlay - bytesWritten);
+            bytesWritten += written;
+            
+            if (written == 0) {
+              vTaskDelay(pdMS_TO_TICKS(1));
+            }
+          }
+          
+          speakerAudioState.playPosition += bytesToPlay;
+        }
+      }
+      
+      // Check if streaming is complete
+      if (speakerAudioState.audioLoadingComplete && 
+          speakerAudioState.playPosition >= speakerAudioState.receivedAudioSize) {
+        
+        float totalDuration = (float)(speakerAudioState.playPosition / 2) / 16000.0;
+        logInfo("STREAM", "Streaming complete - " + String(totalDuration, 1) + 
+                "s played (" + String(speakerAudioState.playPosition/1024.0, 1) + "KB)");
+        
+        // Turn off LED and reset state
+        digitalWrite(led_pin, LOW);
+        ledState = false;
+        speakerAudioState.isPlaying = false;
+        speakerAudioState.streamingEnabled = false;
+        speakerAudioState.playPosition = 0;
+        speakerAudioState.audioBuffer.clear();
+        
+        // Delete this task
+        speakerAudioState.audioPlaybackTaskHandle = nullptr;
+        vTaskDelete(NULL);
+        return;
+      }
+      
+      // Wait for next chunk interval
+      vTaskDelay(pdMS_TO_TICKS(targetDelayMs));
+    }
+  }
+
+  // High-Quality Audio Playback Function with 16-bit PCM
+  void playAudioBuffer() {
+    if (speakerAudioState.audioBuffer.size() == 0) {
+      logWarn("SPEAKER", "No audio data to play");
+      return;
+    }
+    
+    size_t audioDataSize = speakerAudioState.audioBuffer.size();
+    // Each sample is now 2 bytes (16-bit) at 16kHz
+    float duration = (float)(audioDataSize / 2) / 16000.0;
+    logInfo("SPEAKER", "Playing 16-bit PCM audio: " + String(duration, 1) + " seconds, " + String(audioDataSize) + " bytes");
+    
+    // Anti-click: Send silence first to initialize I2S cleanly
+    const size_t silenceSize = 64;
+    uint8_t silenceBuffer[silenceSize] = {0};
+    i2s_speaker.write(silenceBuffer, silenceSize);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    
+    // Use larger chunks for smoother playback at higher quality
+    const size_t chunkSize = 512;  // Increased for 16kHz data rate
+    size_t totalBytesPlayed = 0;
+    const int rampChunks = 3;  // Ramp over 3 chunks for quick start
+    int chunkCounter = 0;
+    
+    while (totalBytesPlayed < audioDataSize) {
+      size_t bytesToPlay = min(chunkSize, audioDataSize - totalBytesPlayed);
+      
+      // Ensure we don't split 16-bit samples
+      if (bytesToPlay % 2 == 1) {
+        bytesToPlay--;
+      }
+      
+      if (bytesToPlay == 0) break;
+      
+      // Apply volume control and filtering to 16-bit PCM samples
+      std::vector<uint8_t> processedChunk(bytesToPlay);
+      for (size_t i = 0; i < bytesToPlay; i += 2) {
+        // Extract 16-bit sample (little-endian)
+        int16_t sample = speakerAudioState.audioBuffer[totalBytesPlayed + i] | 
+                        (speakerAudioState.audioBuffer[totalBytesPlayed + i + 1] << 8);
+        
+        // Apply volume control with anti-click ramping
+        int32_t adjustedAmplitude = speakerAudioState.amplitude;
+        if (chunkCounter < rampChunks) {
+          adjustedAmplitude = (adjustedAmplitude * (chunkCounter + 1)) / rampChunks;
+        }
+        
+        sample = (int16_t)((int32_t)sample * adjustedAmplitude / 32767);
+        
+        // Apply simple high-pass filter to reduce DC offset and clicks
+        static int16_t lastSample = 0;
+        int16_t filtered = sample - (lastSample >> 4);  // Simple HPF
+        lastSample = sample;
+        
+        // Store back as little-endian
+        processedChunk[i] = filtered & 0xFF;
+        processedChunk[i + 1] = (filtered >> 8) & 0xFF;
+      }
+      
+      chunkCounter++;
+      
+      // Send entire chunk to I2S at once for smoother playback
+      size_t bytesWritten = 0;
+      while (bytesWritten < bytesToPlay) {
+        size_t written = i2s_speaker.write(processedChunk.data() + bytesWritten, 
+                                         bytesToPlay - bytesWritten);
+        bytesWritten += written;
+        
+        // Prevent watchdog timeout on large audio files
+        if (written == 0) {
+          vTaskDelay(pdMS_TO_TICKS(1));
+        }
+      }
+      
+      totalBytesPlayed += bytesToPlay;
+      
+      // Yield periodically to prevent watchdog timeout
+      if (totalBytesPlayed % 2048 == 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+    }
+    
+    logInfo("SPEAKER", "High-quality PCM audio playback finished - played " + String(totalBytesPlayed) + " bytes");
+  }
+
   // Temperature Task
   void temperatureTask(void *param) {
     while (true) {
@@ -869,6 +1261,15 @@
         logInfo("SYS", "VQA running: " + String(vqaState.isRunning ? "Yes" : "No"));
         logInfo("SYS", "Temperature monitoring: " + String(tempMonitoringEnabled ? "Enabled" : "Disabled"));
         logInfo("SYS", "Chunk size: " + String(negotiatedChunkSize) + " bytes");
+        logInfo("SPEAKER", "Audio receiving: " + String(speakerAudioState.receivingAudio ? "Yes" : "No"));
+        logInfo("SPEAKER", "Audio playing: " + String(speakerAudioState.isPlaying ? "Yes" : "No"));
+        logInfo("SPEAKER", "Audio loaded: " + String(speakerAudioState.audioLoadingComplete ? "Yes" : "No"));
+        if (speakerAudioState.audioBuffer.size() > 0) {
+          logInfo("SPEAKER", "Audio buffer: " + String(speakerAudioState.audioBuffer.size()) + " bytes");
+          logInfo("SPEAKER", "Play position: " + String(speakerAudioState.playPosition) + " samples");
+          float progress = (float)speakerAudioState.playPosition / speakerAudioState.audioBuffer.size() * 100;
+          logInfo("SPEAKER", "Playback progress: " + String(progress, 1) + "%");
+        }
         logMemory("SYS");
       }
       else if (cmd == "DEBUG") {
@@ -879,9 +1280,24 @@
         tempMonitoringEnabled = !tempMonitoringEnabled;
         logInfo("CMD", "Temperature monitoring " + String(tempMonitoringEnabled ? "enabled" : "disabled") + " via serial (overheat protection always active)");
       }
+      else if (cmd.startsWith("VOL")) {
+        // Volume control: VOL <number> (0-32767)
+        int spaceIndex = cmd.indexOf(' ');
+        if (spaceIndex > 0) {
+          int newVolume = cmd.substring(spaceIndex + 1).toInt();
+          if (newVolume >= 0 && newVolume <= 32767) {
+            speakerAudioState.amplitude = newVolume;
+            logInfo("CMD", "Speaker volume set to " + String(newVolume));
+          } else {
+            logWarn("CMD", "Volume must be between 0-32767");
+          }
+        } else {
+          logInfo("CMD", "Current volume: " + String(speakerAudioState.amplitude));
+        }
+      }
       else if (cmd.length() > 0) {
         logWarn("CMD", "Unknown serial command: '" + cmd + "'");
-        logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP");
+        logInfo("CMD", "Available commands: VQA_START, VQA_STOP, STATUS, DEBUG, TEMP, VOL <0-32767>");
       }
     }
 
